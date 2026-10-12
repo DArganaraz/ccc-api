@@ -1,0 +1,49 @@
+# MyConnect: build this repo's Docker image and push it to GHCR.
+# Run by hand from the Actions tab ("Run workflow"). Images are tagged with the
+# short commit hash (use that in ccc-deploy/.env) and with "latest".
+name: MyConnect image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: myconnect-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Short commit hash
+        id: tag
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/darganaraz/ccc-api:${{ steps.tag.outputs.sha }}
+            ghcr.io/darganaraz/ccc-api:latest
+          labels: org.opencontainers.image.source=https://github.com/DArganaraz/ccc-api
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: echo "Built ghcr.io/darganaraz/ccc-api:${{ steps.tag.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
