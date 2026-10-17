@@ -97,11 +97,21 @@ export const createApp = async () => {
       app.use(bodyParser.urlencoded({ extended: true, limit: "50mb" }));
     }
 
-    // Only the disk-store commons upload reads req.files; everywhere else multipart would just fill /tmp.
+    // Only the disk-store commons and gallery uploads read req.files; everywhere else multipart would just fill /tmp.
     app.use(
       "/commons/submissions/:id/upload",
       fileUpload({
         limits: { fileSize: 50 * 1024 * 1024, files: 1 },
+        abortOnLimit: true,
+        useTempFiles: true,
+        tempFileDir: "/tmp/"
+      }),
+      removeTempFilesAfterResponse
+    );
+    app.use(
+      "/content/gallery/upload",
+      fileUpload({
+        limits: { fileSize: 15 * 1024 * 1024, files: 1 },
         abortOnLimit: true,
         useTempFiles: true,
         tempFileDir: "/tmp/"

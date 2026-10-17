@@ -29,6 +29,14 @@ describe("isPublicDiskFilePath", () => {
     expect(isPublicDiskFilePath("/content/c1/files/arrangement/a1/track.mp3")).toBe(true);
   });
 
+  it("allows gallery images, which are public-read on S3 too", () => {
+    expect(isPublicDiskFilePath("/c1/gallery/1.78/1700000000.jpeg")).toBe(true);
+    expect(isPublicDiskFilePath("/content/c1/gallery/1.78/1700000000.jpeg")).toBe(true);
+    expect(isPublicDiskFilePath("/c1/gallery/1.78")).toBe(false);
+    expect(isPublicDiskFilePath("/c1/gallery/1.78/x/../../files/group/g1/secret.pdf")).toBe(false);
+    expect(isPublicDiskFilePath("/c1/gallery/../files/x.pdf/y")).toBe(false);
+  });
+
   it("rejects private disk paths", () => {
     expect(isPublicDiskFilePath("/c1/files/group/g1/secret.pdf")).toBe(false);
     expect(isPublicDiskFilePath("/c1/files/groupLeader/g1/notes.pdf")).toBe(false);

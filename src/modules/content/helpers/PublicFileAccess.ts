@@ -16,6 +16,8 @@ export function isPublicDiskFilePath(urlPath: string): boolean {
   // The commons library is a public catalog; only its pending (unreviewed) submissions stay private.
   if (parts[0] === "commons") return parts.length > 1 && parts[1] !== "pending";
   if (parts.length === 3 && parts[1] === "files") return true;
+  // Gallery images (event photos, page images) are public-read on S3; serve them the same way from disk.
+  if (parts.length === 4 && parts[1] === "gallery") return true;
   if (parts.length === 5 && parts[1] === "files" && PUBLIC_CONTENT_TYPES.includes(parts[2])) return true;
   return false;
 }
