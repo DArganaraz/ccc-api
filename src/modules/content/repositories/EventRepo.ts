@@ -37,7 +37,8 @@ export class EventRepo {
       formId: m.formId,
       approvalStatus: m.approvalStatus,
       requestedBy: m.requestedBy,
-      rsvpDisabled: m.rsvpDisabled ?? false
+      rsvpDisabled: m.rsvpDisabled ?? false,
+      photoUrl: m.photoUrl
     } as any).execute();
     return model;
   }
@@ -67,7 +68,8 @@ export class EventRepo {
       approvalStatus: m.approvalStatus,
       requestedBy: m.requestedBy,
       // explicit false so un-disabling RSVP persists (Kysely drops undefined)
-      rsvpDisabled: m.rsvpDisabled ?? false
+      rsvpDisabled: m.rsvpDisabled ?? false,
+      photoUrl: m.photoUrl
     } as any).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
     return model;
   }
@@ -141,9 +143,16 @@ export class EventRepo {
       .orderBy("start").execute() as any;
   }
 
-  public async loadTimelineGroup(churchId: string, groupId: string, eventIds: string[]) {
+  private timelineAccess(groupIds: string[]) {
+    const ids = groupIds || [];
+    return ids.length > 0
+      ? sql`(visibility='public' OR groupId IN (${sql.join(ids.map(id => sql`${id}`), sql`,`)}))`
+      : sql`visibility='public'`;
+  }
+
+  public async loadTimelineGroup(churchId: string, groupId: string, groupIds: string[], eventIds: string[]) {
     let query = sql`select *, 'event' as postType, id as postId from events
-      where churchId=${churchId} AND ((
+      where churchId=${churchId} AND ${this.timelineAccess(groupIds)} AND ((
         groupId = ${groupId}
         and (end>curdate() or recurrenceRule IS NOT NULL)
       )`;
@@ -161,7 +170,7 @@ export class EventRepo {
       ? sql`groupId IN (${sql.join(ids.map(id => sql`${id}`), sql`,`)})`
       : sql`0=1`;
     let query = sql`select *, 'event' as postType, id as postId from events
-      where churchId=${churchId} AND ((
+      where churchId=${churchId} AND ${this.timelineAccess(ids)} AND ((
         (
           ${groupFilter}
           OR groupId IN (SELECT groupId FROM curatedEvents WHERE churchId=${churchId} AND eventId IS NULL)
@@ -201,7 +210,8 @@ export class EventRepo {
       formId: row.formId,
       approvalStatus: row.approvalStatus,
       requestedBy: row.requestedBy,
-      rsvpDisabled: row.rsvpDisabled
+      rsvpDisabled: row.rsvpDisabled,
+      photoUrl: row.photoUrl
     };
   }
 }

@@ -17,7 +17,7 @@ export class EventController extends ContentBaseController {
   public async getPostsForGroup(@requestParam("groupId") groupId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       const eventIds = req.query.eventIds ? req.query.eventIds.toString().split(",") : [];
-      return await this.repos.event.loadTimelineGroup(au.churchId, groupId, eventIds);
+      return await this.repos.event.loadTimelineGroup(au.churchId, groupId, au.groupIds || [], eventIds);
     });
   }
 
@@ -122,15 +122,40 @@ export class EventController extends ContentBaseController {
     });
   }
 
+  // Single-event .ics for the public event page's "Add to my calendar" link.
+  @httpGet("/public/:churchId/:id/ical")
+  public async getPublicIcal(@requestParam("churchId") churchId: string, @requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapperAnon(req, res, async () => {
+      const event = await this.loadPublicEvent(churchId, id);
+      if (!event) return this.json({}, 404);
+      await CalendarHelper.addExceptionDates([event], this.repos);
+      const { error, value } = ics.createEvents(this.populateEventsForICS([event]));
+      if (error) {
+        res.status(500).send("Error generating calendar.");
+        return;
+      }
+      res.set("Content-Type", "text/calendar");
+      res.send(value);
+    });
+  }
+
   @httpGet("/public/:churchId/:id")
   public async getPublicById(@requestParam("churchId") churchId: string, @requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapperAnon(req, res, async () => {
-      const event = await this.repos.event.load(churchId, id);
+      const event = await this.loadPublicEvent(churchId, id);
       if (!event) return null;
-      if (event.approvalStatus === "pending" || event.approvalStatus === "rejected") return null;
-      if (event.visibility !== "public" && !event.registrationEnabled) return null;
-      return event;
+      const bookings = await this.repos.eventBooking.loadForEvent(churchId, id);
+      const roomNames = bookings.filter((b) => b.roomId && b.status !== "rejected" && b.roomName).map((b) => b.roomName as string);
+      return { ...event, roomNames };
     });
+  }
+
+  private async loadPublicEvent(churchId: string, id: string): Promise<Event | null> {
+    const event = await this.repos.event.load(churchId, id);
+    if (!event) return null;
+    if (event.approvalStatus === "pending" || event.approvalStatus === "rejected") return null;
+    if (event.visibility !== "public" && !event.registrationEnabled) return null;
+    return event;
   }
 
   @httpGet("/public/group/:churchId/:groupId")

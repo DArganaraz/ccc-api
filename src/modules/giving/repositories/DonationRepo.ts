@@ -105,16 +105,31 @@ export class DonationRepo {
       .executeTakeFirst()) ?? null;
   }
 
-  public async loadByPersonId(churchId: string, personId: string) {
+  public async loadByPersonId(churchId: string, personId: string, includeNonDeductible = false) {
     // LEFT JOIN, not INNER: a donation whose fund allocation was never written still
     // belongs in the donor's history. An INNER JOIN silently dropped those rows.
+    // Giving statements leave out non-deductible funds; the admin person record asks for every gift.
+    const deductible = includeNonDeductible ? sql`` : sql`AND (f.taxDeductible = 1 OR f.taxDeductible IS NULL)`;
     const result = await sql<any>`
       SELECT d.*, f.id as fundId, IFNULL(f.name, 'Unkown') as fundName, fd.amount as fundAmount
       FROM donations d
       LEFT JOIN fundDonations fd on fd.donationId = d.id
       LEFT JOIN funds f on f.id = fd.fundId
-      WHERE d.churchId = ${churchId} AND d.personId = ${personId} AND (d.status IS NULL OR d.status = 'complete') AND (f.taxDeductible = 1 OR f.taxDeductible IS NULL)
+      WHERE d.churchId = ${churchId} AND d.personId = ${personId} AND (d.status IS NULL OR d.status = 'complete') ${deductible}
       ORDER BY d.donationDate DESC`.execute(getDb());
+    return result.rows;
+  }
+
+  // Same rows as loadByPersonId (complete gifts to deductible funds), grouped by currency for one calendar year.
+  public async loadPersonYearTotals(churchId: string, personId: string, year: number) {
+    const result = await sql<{ currency: string | null; amount: number; donationCount: number }>`
+      SELECT d.currency, SUM(IFNULL(fd.amount, d.amount)) as amount, COUNT(DISTINCT d.id) as donationCount
+      FROM donations d
+      LEFT JOIN fundDonations fd on fd.donationId = d.id
+      LEFT JOIN funds f on f.id = fd.fundId
+      WHERE d.churchId = ${churchId} AND d.personId = ${personId} AND (d.status IS NULL OR d.status = 'complete')
+        AND (f.taxDeductible = 1 OR f.taxDeductible IS NULL) AND YEAR(d.donationDate) = ${year}
+      GROUP BY d.currency`.execute(getDb());
     return result.rows;
   }
 

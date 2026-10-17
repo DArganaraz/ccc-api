@@ -90,6 +90,17 @@ export class DonationController extends GivingBaseController {
     });
   }
 
+  @httpGet("/my/summary")
+  public async getMySummary(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      const year = parseInt(req.query.year?.toString() || "", 10) || new Date().getFullYear();
+      const rows = await this.repos.donation.loadPersonYearTotals(au.churchId, au.personId, year);
+      const { currency, rates } = await this.loadChurchRates(au.churchId);
+      const converted = ExchangeRateHelper.convertTotals(rows.map((r) => ({ currency: r.currency, amount: Number(r.amount || 0) })), currency, rates);
+      return { year, total: converted.totalAmount, count: rows.reduce((sum, r) => sum + Number(r.donationCount || 0), 0), currency, isConverted: converted.isConverted };
+    });
+  }
+
   @httpGet("/failed")
   public async getFailed(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
@@ -123,7 +134,7 @@ export class DonationController extends GivingBaseController {
       else {
         let result;
         if (canView && req.query.batchId !== undefined) result = await this.repos.donation.loadByBatchId(au.churchId, req.query.batchId.toString());
-        else if (personId) result = await this.repos.donation.loadByPersonId(au.churchId, personId);
+        else if (personId) result = await this.repos.donation.loadByPersonId(au.churchId, personId, canView && req.query.includeNonDeductible === "1");
         else result = await this.repos.donation.loadAll(au.churchId);
         return this.repos.donation.convertAllToModel(au.churchId, result as any[] as any[]);
       }
