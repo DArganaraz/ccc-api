@@ -57,6 +57,9 @@ export class CuratedEventController extends ContentBaseController {
           const saveFunction = async () => {
             if (curatedEvent?.eventIds) {
               // If eventIds are there, it means only specific group events are need to be added.
+              // Skip them when the whole group is already on this calendar, or they'd show twice.
+              const existing: CuratedEvent[] = await this.repos.curatedEvent.loadByCuratedCalendarId(au.churchId, curatedEvent.curatedCalendarId);
+              if (existing.some((e) => !e.eventId && e.groupId === curatedEvent.groupId)) return [];
               const eventPromises: Promise<CuratedEvent>[] = [];
               curatedEvent.eventIds.forEach((id) => {
                 eventPromises.push(this.repos.curatedEvent.save({ ...curatedEvent, eventId: id }));

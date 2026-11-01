@@ -91,7 +91,15 @@ export class CuratedEventRepo {
       .where("ce.curatedCalendarId", "=", curatedCalendarId)
       .where("ce.churchId", "=", churchId);
     if (!includePrivate) query = query.where("e.visibility", "=", "public");
-    return query.execute();
+    // An event can be on the calendar twice: through its whole group and on its own. Return it once,
+    // keeping its own entry so removing just that event from the calendar still works.
+    const rows: any[] = await query.execute();
+    const byEvent = new Map<string, any>();
+    for (const row of rows) {
+      const kept = byEvent.get(row.realEventId);
+      if (!kept || (!kept.eventId && row.eventId)) byEvent.set(row.realEventId, row);
+    }
+    return [...byEvent.values()];
   }
 
   public convertToModel(_churchId: string, data: any) { return data as CuratedEvent; }
