@@ -139,7 +139,7 @@ export class RegistrationController extends ContentBaseController {
           await this.insertMembers(churchId, registration.id, members, typeMap, true);
           try {
             const church = await getMembershipModuleGateway().loadChurch(churchId);
-            await RegistrationHelper.sendConfirmationEmail(email, church?.name || "Church", event, registration, members as any, church?.timeZone);
+            await RegistrationHelper.sendConfirmationEmail(email, church?.name || "Church", event, registration, members as any, church?.timeZone, church?.subDomain);
           } catch (e) { console.error("Failed to send waitlist email", e); }
           return redact({ ...registration, members, status: "waitlisted" });
         }
@@ -183,7 +183,7 @@ export class RegistrationController extends ContentBaseController {
 
       try {
         const church = await getMembershipModuleGateway().loadChurch(churchId);
-        await RegistrationHelper.sendConfirmationEmail(email, church?.name || "Church", event, registration, memberResult.members, church?.timeZone);
+        await RegistrationHelper.sendConfirmationEmail(email, church?.name || "Church", event, registration, memberResult.members, church?.timeZone, church?.subDomain);
       } catch (e) {
         console.error("Failed to send registration confirmation email", e);
       }

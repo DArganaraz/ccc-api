@@ -18,12 +18,20 @@ export class RegistrationHelper {
     }
   }
 
-  static async sendConfirmationEmail(email: string, churchName: string, event: Event, registration: Registration, members: RegistrationMember[], timeZone?: string) {
+  // The church's member website, from B1APP_ROOT (e.g. https://{subdomain}.b1.church, or a fixed address).
+  static memberSiteUrl(subDomain?: string): string {
+    if (!subDomain || !Environment.b1AppRoot) return "";
+    return Environment.b1AppRoot.split("{subdomain}").join(subDomain).replace(/\/$/, "");
+  }
+
+  static async sendConfirmationEmail(email: string, churchName: string, event: Event, registration: Registration, members: RegistrationMember[], timeZone?: string, subDomain?: string) {
     if (!email) return;
 
     const tz = this.validTimeZone(timeZone);
-    const eventDate = event.start ? new Date(event.start).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: tz }) : "";
-    const eventTime = event.allDay ? "All Day" : event.start ? new Date(event.start).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz, timeZoneName: "short" }) : "";
+    const eventDate = event.start ? new Date(event.start).toLocaleDateString("en-AU", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: tz }) : "";
+    const eventTime = event.allDay ? "All Day" : event.start ? new Date(event.start).toLocaleTimeString("en-AU", { hour: "numeric", minute: "2-digit", timeZone: tz, timeZoneName: "short" }) : "";
+    const siteUrl = this.memberSiteUrl(subDomain);
+    const siteLine = siteUrl ? `<p>Thanks for registering! See what else is coming up at <a href="${this.escapeHtml(siteUrl)}">${this.escapeHtml(siteUrl.replace(/^https?:\/\//, ""))}</a>.</p>` : "";
 
     let memberList = "";
     if (members && members.length > 0) {
@@ -43,10 +51,11 @@ export class RegistrationHelper {
         <tr><td><strong>Status:</strong></td><td>${registration.status}</td></tr>
       </table>
       ${memberList}
+      ${siteLine}
       <p>If you need to cancel your registration, please visit the church website or contact the church office.</p>
     `;
 
-    await TransactionalEmailHelper.sendTransactional(Environment.supportEmail, email, churchName, Environment.b1AdminRoot, "Registration Confirmed: " + event.title, contents);
+    await TransactionalEmailHelper.sendTransactional(Environment.supportEmail, email, churchName, siteUrl || Environment.b1AdminRoot, "Registration Confirmed: " + event.title, contents);
   }
 
   static async sendWaitlistAvailabilityEmail(email: string, churchName: string, event: Event, payUrl?: string) {
