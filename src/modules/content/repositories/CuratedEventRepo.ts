@@ -87,7 +87,11 @@ export class CuratedEventRepo {
         "e.recurrenceRule",
         "e.visibility",
         "e.photoUrl",
-        "e.tags"
+        "e.tags",
+        // Lets calendar tiles show a "Registration open" badge.
+        "e.registrationEnabled",
+        "e.registrationOpenDate",
+        "e.registrationCloseDate"
       ])
       .where("ce.curatedCalendarId", "=", curatedCalendarId)
       .where("ce.churchId", "=", churchId);
