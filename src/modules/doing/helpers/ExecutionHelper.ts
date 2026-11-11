@@ -3,6 +3,7 @@ import { AutomationExecution, Task, WorkflowTrigger } from "../models/index.js";
 import { ConjunctionHelper } from "./ConjunctionHelper.js";
 import { FilterMatcher } from "./FilterMatcher.js";
 import { WorkflowHelper } from "./WorkflowHelper.js";
+import { EventContext } from "./EventContext.js";
 import { getMembershipModuleGateway } from "../../../shared/modules/index.js";
 
 interface Subject {
@@ -17,7 +18,7 @@ export class ExecutionHelper {
   private static readonly MAX_ATTEMPTS = 6;
   private static readonly RETRY_MINUTES = [5, 30, 120, 720, 1440];
 
-  public static async startAndAttempt(trigger: WorkflowTrigger, subject: Subject, eventType: string, repos: Repos): Promise<AutomationExecution> {
+  public static async startAndAttempt(trigger: WorkflowTrigger, subject: Subject, eventType: string, repos: Repos, context?: EventContext): Promise<AutomationExecution> {
     const execution: AutomationExecution = {
       churchId: trigger.churchId,
       triggerId: trigger.id,
@@ -31,10 +32,11 @@ export class ExecutionHelper {
       nextAttemptAt: this.addMinutes(new Date(), this.LEASE_MINUTES)
     };
     await repos.automationExecution.save(execution);
-    return this.attempt(execution, trigger, repos);
+    return this.attempt(execution, trigger, repos, context);
   }
 
-  public static async attempt(execution: AutomationExecution, trigger: WorkflowTrigger, repos: Repos): Promise<AutomationExecution> {
+  // A retry has no context (the execution row does not keep it), so its card's gift fields stay blank.
+  public static async attempt(execution: AutomationExecution, trigger: WorkflowTrigger, repos: Repos, context?: EventContext): Promise<AutomationExecution> {
     let card: Task | null = null;
     try {
       // A retry may follow a crash after the card was created — don't double-add.
@@ -53,7 +55,9 @@ export class ExecutionHelper {
         { type: "system", label: "Trigger" },
         trigger.id,
         repos,
-        trigger.stepId || undefined
+        trigger.stepId || undefined,
+        0,
+        context
       );
       if (!card) throw new Error("Workflow has no steps");
       execution.attemptCount = (execution.attemptCount ?? 0) + 1;
@@ -93,6 +97,14 @@ export class ExecutionHelper {
       const before = peopleIds.length;
       peopleIds = peopleIds.filter((id) => !seen.has(id));
       skipped = before - peopleIds.length;
+    }
+    if (FilterMatcher.toBool(rule.oncePerSubject)) {
+      const remaining: string[] = [];
+      for (const id of peopleIds) {
+        if (await this.existingCardForSubject(rule, "person", id, repos)) skipped++;
+        else remaining.push(id);
+      }
+      peopleIds = remaining;
     }
     if (peopleIds.length === 0) return { created: 0, skipped };
 
@@ -197,10 +209,21 @@ export class ExecutionHelper {
     if (!execution.subjectId) return false;
     if (trigger.triggerKind === "schedule") {
       const existing = (await repos.task.loadByTriggerIdContent(execution.churchId || "", trigger.id || "", trigger.recurs || "", execution.subjectType || "person", [execution.subjectId])) as Task[];
-      return existing.length > 0;
+      if (existing.length > 0) return true;
     }
     if (!FilterMatcher.toBool(trigger.oncePerSubject)) return false;
-    return !!(await repos.task.loadBySubjectInWorkflow(execution.churchId || "", trigger.workflowId || "", execution.subjectType || "person", execution.subjectId));
+    return !!(await this.existingCardForSubject({ ...trigger, churchId: execution.churchId }, execution.subjectType || "person", execution.subjectId, repos));
+  }
+
+  // The "Only once per person" check, shared by the event path and retries. With
+  // allowRepeatAfterClose only an open card blocks; otherwise any card ever made does.
+  public static async existingCardForSubject(trigger: WorkflowTrigger, subjectType: string, subjectId: string, repos: Repos): Promise<Task | null> {
+    const churchId = trigger.churchId || "";
+    const workflowId = trigger.workflowId || "";
+    const openOnly = trigger.allowRepeatAfterClose !== undefined && trigger.allowRepeatAfterClose !== null && FilterMatcher.toBool(trigger.allowRepeatAfterClose);
+    return (openOnly
+      ? await repos.task.loadOpenBySubjectInWorkflow(churchId, workflowId, subjectType, subjectId)
+      : await repos.task.loadBySubjectInWorkflow(churchId, workflowId, subjectType, subjectId)) as Task | null;
   }
 
   private static async complete(execution: AutomationExecution, repos: Repos): Promise<AutomationExecution> {

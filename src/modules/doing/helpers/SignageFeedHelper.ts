@@ -8,6 +8,7 @@ export interface FeedFile {
   url?: string;
   seconds?: number;
   loop?: boolean;
+  fileType?: string;
 }
 
 interface FeedAction {
@@ -36,6 +37,10 @@ export interface SignageFile {
   url: string;
   seconds: number;
   loopVideo: boolean;
+  mediaType?: "video" | "image" | "audio";
+  providerId?: string;
+  providerPath?: string;
+  fileId?: string;
 }
 
 export interface SignageMessage {
@@ -65,8 +70,17 @@ export class SignageFeedHelper {
       const loopVideo = !!f.loop;
       let seconds = f.seconds || 0;
       if (!seconds || loopVideo) seconds = 3600;
-      return { name: f.name, url: f.url as string, seconds, loopVideo };
+      const result: SignageFile = { name: f.name, url: f.url as string, seconds, loopVideo };
+      const mediaType = this.mediaTypeFromFileType(f.fileType);
+      if (mediaType) result.mediaType = mediaType;
+      return result;
     });
+  }
+
+  // lessons.church sends a MIME type; its video links (externalVideos/download/<id>) have no extension to guess from.
+  static mediaTypeFromFileType(fileType: string | undefined): SignageFile["mediaType"] | undefined {
+    const kind = (fileType || "").toLowerCase().split("/")[0];
+    return kind === "video" || kind === "image" || kind === "audio" ? kind : undefined;
   }
 
   static getSectionFiles(venueFeed: FeedVenue, sectionId: string): SignageFile[] {
@@ -89,7 +103,9 @@ export class SignageFeedHelper {
     return [];
   }
 
-  private static getItemFiles(item: PlanItem, venueFeed: FeedVenue | null): SignageFile[] {
+  // `resolved` holds files the caller already looked up for provider-linked items that carry no link (customized GO plans).
+  private static getItemFiles(item: PlanItem, venueFeed: FeedVenue | null, resolved?: Map<PlanItem, SignageFile[]>): SignageFile[] {
+    if (resolved?.has(item)) return resolved.get(item);
     if (ACTION_TYPES.has(item.itemType || "") && item.relatedId && venueFeed) return this.getActionFiles(venueFeed, item.relatedId);
     if (LINK_TYPES.has(item.itemType || "") && item.link) {
       return [{ name: item.label, url: item.link, seconds: item.seconds || 3600, loopVideo: false }];
@@ -97,17 +113,20 @@ export class SignageFeedHelper {
     return [];
   }
 
-  static buildMessages(planItems: PlanItem[], venueFeed: FeedVenue | null): SignageMessage[] {
+  static buildMessages(planItems: PlanItem[], venueFeed: FeedVenue | null, resolved?: Map<PlanItem, SignageFile[]>): SignageMessage[] {
     const messages: SignageMessage[] = [];
     const walk = (items: PlanItem[]) => {
       for (const item of items || []) {
         if (SECTION_TYPES.has(item.itemType || "")) {
-          const childFiles = (item.children || []).flatMap((c) => this.getItemFiles(c, venueFeed));
+          const childFiles = (item.children || []).flatMap((c) => this.getItemFiles(c, venueFeed, resolved));
           let files = childFiles;
-          if (files.length === 0 && (item.children || []).length === 0 && item.relatedId && venueFeed) files = this.getSectionFiles(venueFeed, item.relatedId);
+          if (files.length === 0 && (item.children || []).length === 0) {
+            if (resolved?.has(item)) files = resolved.get(item);
+            else if (item.relatedId && venueFeed) files = this.getSectionFiles(venueFeed, item.relatedId);
+          }
           if (files.length > 0) messages.push({ name: item.label || "Section", files });
         } else {
-          const files = this.getItemFiles(item, venueFeed);
+          const files = this.getItemFiles(item, venueFeed, resolved);
           if (files.length > 0) messages.push({ name: item.label || "Item", files });
           else walk(item.children || []);
         }
@@ -142,11 +161,11 @@ export class SignageFeedHelper {
     return result;
   }
 
-  static async buildPlanFeed(plan: Plan, planItems: PlanItem[]): Promise<{ messages: SignageMessage[]; venueFeed: FeedVenue | null }> {
+  static async buildPlanFeed(plan: Plan, planItems: PlanItem[], resolved?: Map<PlanItem, SignageFile[]>): Promise<{ messages: SignageMessage[]; venueFeed: FeedVenue | null }> {
     const venueId = this.getVenueId(plan, planItems);
     const venueFeed = venueId ? await this.fetchVenueFeed(venueId) : null;
     const tree = this.buildTree(planItems, null);
-    const messages = tree.length > 0 ? this.buildMessages(tree, venueFeed) : this.buildDefaultMessages(venueFeed);
+    const messages = tree.length > 0 ? this.buildMessages(tree, venueFeed, resolved) : this.buildDefaultMessages(venueFeed);
     return { messages, venueFeed };
   }
 
@@ -154,7 +173,9 @@ export class SignageFeedHelper {
     const primaryLessonItem = planItems.find((pi) => pi.providerId && pi.providerPath);
     if (primaryLessonItem) {
       if (primaryLessonItem.providerId !== "lessonschurch") return null;
-      return primaryLessonItem.providerPath || null;
+      // Customized plans store the full content path (/lessons/{program}/{study}/{lesson}/{venueId}); the venue id is the last segment.
+      const venueId = (primaryLessonItem.providerPath || "").split("/").filter(Boolean).pop();
+      return venueId || plan.contentId || null;
     }
     if (plan.providerId && plan.providerId !== "lessonschurch") return null;
     return plan.contentId || null;

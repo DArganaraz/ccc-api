@@ -5,9 +5,18 @@ import { Conversation, Message } from "../models/index.js";
 import { ArrayHelper, EncryptionHelper } from "@churchapps/apihelper";
 import { DeliveryHelper } from "../helpers/DeliveryHelper.js";
 import { Permissions } from "../../../shared/helpers/Permissions.js";
+import { TaskAuth } from "../../../shared/helpers/TaskAuth.js";
 
 const contentRoom = (contentType?: string, contentId?: string) =>
   contentType && contentId ? `content-${contentType}-${contentId}` : null;
+
+// Notes page sections and the conversation content types each one lists.
+const NOTE_SECTIONS: Record<string, string[]> = {
+  people: ["person", "personConfidential"],
+  groups: ["groupNote"],
+  events: ["eventNote"],
+  workflows: ["workflowCard"]
+};
 
 @controller("/messaging/conversations")
 export class ConversationController extends MessagingBaseController {
@@ -55,6 +64,84 @@ export class ConversationController extends MessagingBaseController {
       }
       return result || [];
     }) as any;
+  }
+
+  // Notes page (ChurchAppsSupport#1334): newest notes of one section across every record. Each note
+  // still passes the rule its own type already enforces, so nobody sees a note they couldn't open.
+  @httpGet("/notes/feed")
+  public async notesFeed(req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!this.isAuthenticated(au)) return this.json({}, 401);
+      const section = (req.query.section || "").toString();
+      if (!NOTE_SECTIONS[section]) return this.json({}, 400);
+      const limit = Math.min(Math.max(parseInt((req.query.limit as string) || "25", 10) || 25, 1), 100);
+      let before = this.parseNotesCursor((req.query.before || "").toString());
+
+      let contentTypes = NOTE_SECTIONS[section];
+      let contentIds: string[] | null = null;
+      if (section === "people") contentTypes = contentTypes.filter((t) => this.canViewPersonNotes(au, t));
+      if (section === "groups") contentIds = au.leaderGroupIds || [];
+
+      const sources = new Map<string, { allowed: boolean; name?: string; parentId?: string }>();
+      const notes: any[] = [];
+      let exhausted = false;
+      // Rows the caller can't see are dropped after the query, so keep reading until the page is full.
+      for (let batch = 0; batch < 5 && notes.length < limit && !exhausted; batch++) {
+        const rows: any[] = await this.repos.conversation.loadNotesFeed(au.churchId, contentTypes, contentIds, before, limit * 2);
+        if (rows.length < limit * 2) exhausted = true;
+        if (rows.length === 0) break;
+        await this.loadNoteSources(au, section, rows, sources);
+        for (const row of rows) {
+          before = { timeSent: row.timeSent, id: row.messageId };
+          const source = sources.get(row.contentId);
+          if (!source?.allowed) continue;
+          notes.push({ ...row, content: (row.content || "").length > 300 ? row.content.substring(0, 300) + "…" : row.content, sourceName: source.name || "", parentId: source.parentId });
+          if (notes.length === limit) break;
+        }
+      }
+      // A full page resumes after its last note; a short page that ran out of batches resumes after the last row read.
+      const last = notes[notes.length - 1];
+      const cursorAt = notes.length === limit ? { timeSent: last.timeSent, id: last.messageId } : (exhausted ? null : before);
+      return { notes, cursor: cursorAt ? new Date(cursorAt.timeSent).toISOString() + "|" + cursorAt.id : null };
+    }) as any;
+  }
+
+  private parseNotesCursor(value: string) {
+    const [time, id] = value.split("|");
+    const timeSent = new Date(time);
+    return id && !isNaN(timeSent.getTime()) ? { timeSent, id } : null;
+  }
+
+  // Looks up each new source once per request: whether the caller may see its notes, its display name,
+  // and the parent the client links through (an event's group, a card's workflow).
+  private async loadNoteSources(au: any, section: string, rows: any[], sources: Map<string, { allowed: boolean; name?: string; parentId?: string }>) {
+    const ids = Array.from(new Set(rows.map((r) => r.contentId))).filter((id) => !sources.has(id));
+    if (ids.length === 0) return;
+    if (section === "people") {
+      const { getMembershipModuleGateway } = await import("../../../shared/modules/MembershipModuleGateway.js");
+      const people = await getMembershipModuleGateway().loadPeople(au.churchId, ids);
+      // loadPeople skips removed people, so notes left on a deleted or merged-away person drop out instead of showing "(unknown)".
+      ids.forEach((id) => { const person = people.find((p) => p.id === id); sources.set(id, { allowed: !!person, name: person?.displayName }); });
+    } else if (section === "groups") {
+      const { getMembershipModuleGateway } = await import("../../../shared/modules/MembershipModuleGateway.js");
+      for (const id of ids) {
+        const group: any = await getMembershipModuleGateway().loadGroup(au.churchId, id);
+        sources.set(id, { allowed: this.canUseGroupNotes(au, id), name: group?.name });
+      }
+    } else if (section === "events") {
+      const { getContentModuleGateway } = await import("../../../shared/modules/ContentModuleGateway.js");
+      const isCalendarStaff = au.checkAccess(Permissions.content.edit) || au.checkAccess(Permissions.calendars.admin);
+      for (const id of ids) {
+        const event: any = await getContentModuleGateway().loadEvent(au.churchId, id);
+        sources.set(id, { allowed: !!event && (isCalendarStaff || this.eventRoleAllows(au, event, "view")), name: event?.title, parentId: event?.groupId });
+      }
+    } else if (section === "workflows") {
+      const { getDoingModuleGateway } = await import("../../../shared/modules/DoingModuleGateway.js");
+      for (const id of ids) {
+        const task: any = await getDoingModuleGateway().loadTask(au.churchId, id);
+        sources.set(id, { allowed: !!task && TaskAuth.canViewTask(au, task), name: task?.title, parentId: task?.workflowId });
+      }
+    }
   }
 
   @httpGet("/messages/:contentType/:contentId")
@@ -150,6 +237,8 @@ export class ConversationController extends MessagingBaseController {
   @httpPost("/")
   public async save(req: express.Request<{}, {}, Conversation[]>, res: express.Response): Promise<Conversation[]> {
     return this.actionWrapper(req, res, async (au) => {
+      // Signed-out callers have no church; without this they could create orphan conversations.
+      if (!au?.churchId) return this.json({}, 401);
       for (const conversation of req.body) {
         if (conversation.id) {
           const existing = await this.repos.conversation.loadById(au.churchId, conversation.id);
@@ -157,9 +246,9 @@ export class ConversationController extends MessagingBaseController {
           conversation.contentType = existing.contentType;
           conversation.contentId = existing.contentId;
           const isLeader = this.isGroupFeed(existing.contentType) && !!au.leaderGroupIds?.includes(existing.contentId);
-          if (!this.isPersonNote(existing.contentType) && !isLeader && !au.checkAccess(Permissions.content.edit)) return this.json({}, 401);
+          if (!this.isNote(existing.contentType) && !isLeader && !au.checkAccess(Permissions.content.edit)) return this.json({}, 401);
         }
-        if (this.isPersonNote(conversation.contentType) && !this.canViewPersonNotes(au, conversation.contentType)) return this.json({}, 401);
+        if (this.isNote(conversation.contentType) && !(await this.canUseNotes(au, conversation, "post"))) return this.json({}, 401);
         // A group feed row is seeded lazily by the first poster, so seeding needs the same rights as posting.
         if (this.isGroupFeed(conversation.contentType) && !(await this.canPostToGroupFeed(au, conversation.contentType, conversation.contentId))) return this.json({}, 401);
       }
@@ -186,33 +275,40 @@ export class ConversationController extends MessagingBaseController {
     }) as any;
   }
 
+  // loadPosts returns every conversation tied to the groups, including leader-only and event notes;
+  // only callers who pass the notes gate may see those.
+  private async withoutHiddenNotes(au: any, conversations: any[]): Promise<any[]> {
+    if (!Array.isArray(conversations)) return [];
+    const visible: any[] = [];
+    for (const c of conversations) {
+      if (!this.isNote(c.contentType) || await this.canUseNotes(au, c, "view")) visible.push(c);
+    }
+    return visible;
+  }
+
   @httpGet("/posts/group/:groupId")
   public async getPostsForGroup(@requestParam("groupId") groupId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (!(await this.canReadContent(au, "group", groupId))) return this.json([], 401);
-      const result = await this.repos.conversation.loadPosts(au.churchId, [groupId]);
-      if (result && Array.isArray(result)) {
-        await this.appendMessages(result, au.churchId);
-      }
-      return result || [];
+      const result = await this.withoutHiddenNotes(au, await this.repos.conversation.loadPosts(au.churchId, [groupId]));
+      await this.appendMessages(result, au.churchId);
+      return result;
     }) as any;
   }
 
   @httpGet("/posts")
   public async getPosts(req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
-      const result = await this.repos.conversation.loadPosts(au.churchId, au.groupIds || []);
-      if (result && Array.isArray(result)) {
-        await this.appendMessages(result, au.churchId);
-      }
-      return result || [];
+      const result = await this.withoutHiddenNotes(au, await this.repos.conversation.loadPosts(au.churchId, au.groupIds || []));
+      await this.appendMessages(result, au.churchId);
+      return result;
     }) as any;
   }
 
   @httpPost("/start")
   public async start(req: express.Request<{}, {}, { groupId: string; contentType: string; contentId: string; title: string; comment: string }>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
-      if (this.isPersonNote(req.body.contentType) && !this.canViewPersonNotes(au, req.body.contentType)) return this.json({}, 401);
+      if (this.isNote(req.body.contentType) && !(await this.canUseNotes(au, req.body, "post"))) return this.json({}, 401);
       if (this.isGroupFeed(req.body.contentType) && !(await this.canPostToGroupFeed(au, req.body.contentType, req.body.contentId))) return this.json({}, 401);
       const c: Conversation = {
         churchId: au.churchId,
@@ -298,20 +394,8 @@ export class ConversationController extends MessagingBaseController {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.content.edit)) return this.json({}, 401);
       await this.repos.conversation.delete(au.churchId, id);
+      return this.json({});
     }) as any;
-  }
-
-  // Content-type level gate for routes that authorize before the conversation row exists (or before it
-  // is loaded). Mirrors canReadConversation minus the row-level checks.
-  private async canReadContent(au: any, contentType: string, contentId: string): Promise<boolean> {
-    if (this.isPersonNote(contentType)) return this.canViewPersonNotes(au, contentType);
-    if (au?.checkAccess(Permissions.content.edit)) return true;
-    if (contentType === "group" || contentType === "groupAnnouncement") {
-      return !!contentId && (!!au?.groupIds?.includes(contentId) || !!au?.leaderGroupIds?.includes(contentId));
-    }
-    if (contentType === "streamingLiveHost") return !!au?.checkAccess(Permissions.chat.host);
-    if (contentType === "workflowCard") return this.canUseWorkflowCard(au, contentId);
-    return true;
   }
 
   private async getOrCreate(churchId: string, contentType: string, contentId: string, visibility: string, allowAnonymousPosts: boolean, decryptContentId: boolean) {

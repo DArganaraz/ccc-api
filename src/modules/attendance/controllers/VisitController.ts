@@ -4,7 +4,7 @@ import { AttendanceBaseController } from "./AttendanceBaseController.js";
 import { Visit, VisitSession, Session } from "../models/index.js";
 import { Permissions } from "../../../shared/helpers/index.js";
 import { WebhookDispatcher } from "../../../shared/webhooks/index.js";
-import { SecurityCodeHelper, CheckinGateHelper } from "../helpers/index.js";
+import { SecurityCodeHelper, CheckinGateHelper, CheckinTimeZoneHelper } from "../helpers/index.js";
 import type { GateGroup, GateCount, GateIncoming, GateServiceTime } from "../helpers/CheckinGateHelper.js";
 import { getMembershipModuleGateway } from "../../../shared/modules/index.js";
 
@@ -57,11 +57,13 @@ export class VisitController extends AttendanceBaseController {
                   sessions?.forEach((s) => {
                     if (s.id === vs.sessionId) vs.session = s;
                   });
-                  v.visitSessions.push(vs);
+                  // A visitSession whose session row is missing (NULL or deleted sessionId) can't be re-posted to postCheckin.
+                  if (vs.session) v.visitSessions.push(vs);
                 }
               });
               result.push(v);
             });
+            await this.dropClosedTemplateSessions(au.churchId, visits, currentDate);
           }
 
           // Ids are always dropped (postCheckin replaces today's rows); only today's visits keep their security code.
@@ -113,6 +115,7 @@ export class VisitController extends AttendanceBaseController {
         const deleteVisitSessionIds: string[] = [];
 
         const submittedVisits = [...req.body];
+        if (submittedVisits.some((sv) => sv.visitSessions?.some((vs) => !vs.session?.serviceTimeId || !vs.session?.groupId))) return this.json({ error: "Each visit session needs a session with serviceTimeId and groupId" }, 400);
         // Re-check-ins keep their existing code; a fresh one would be returned to the client without ever being saved.
         // Only a code this batch's people already hold today is kept; anything else from the client is replaced.
         const existingCodes = new Set(existingVisits.map((v) => v.securityCode).filter(Boolean));
@@ -148,8 +151,10 @@ export class VisitController extends AttendanceBaseController {
           this.populateDeleteIds(existingVisits, submittedVisits, visitSessions, deleteVisitIds, deleteVisitSessionIds);
         }
 
+        // Today's visits are re-posted with every check-in, so sessions people already hold skip the check-in window gate.
+        const heldSessions = new Set(existingVisits.flatMap((v) => (v.visitSessions || []).map((vs) => v.personId + "|" + vs.sessionId)));
         // Capacity + volunteer-ratio gates run BEFORE any save (postCheckin is not transactional).
-        const gateResponse = await this.evaluateGates(au.churchId, submittedVisits, peopleIds, req.query.acknowledgeWarnings === "true");
+        const gateResponse = await this.evaluateGates(au.churchId, submittedVisits, peopleIds, req.query.acknowledgeWarnings === "true", heldSessions);
         if (gateResponse) return this.json(gateResponse.body, gateResponse.status);
 
         const promises: Promise<any>[] = [];
@@ -284,7 +289,7 @@ export class VisitController extends AttendanceBaseController {
   }
 
   // Returns a {body,status} 409 payload when the batch must be rejected, else null.
-  private async evaluateGates(churchId: string, submittedVisits: Visit[], batchPersonIds: string[], acknowledgeWarnings: boolean): Promise<{ body: any; status: number } | null> {
+  private async evaluateGates(churchId: string, submittedVisits: Visit[], batchPersonIds: string[], acknowledgeWarnings: boolean, heldSessions: Set<string>): Promise<{ body: any; status: number } | null> {
     const incoming: Record<string, GateIncoming> = {};
     const targetGroupIds = new Set<string>();
     const serviceTimeGroups: Record<string, Set<string>> = {};
@@ -296,7 +301,7 @@ export class VisitController extends AttendanceBaseController {
         if (!gid) return;
         targetGroupIds.add(gid);
         const stId = vs.session?.serviceTimeId;
-        if (stId) (serviceTimeGroups[stId] ?? (serviceTimeGroups[stId] = new Set())).add(gid);
+        if (stId && !heldSessions.has(sv.personId + "|" + vs.sessionId)) (serviceTimeGroups[stId] ?? (serviceTimeGroups[stId] = new Set())).add(gid);
         const e = incoming[gid] ?? (incoming[gid] = { total: 0, volunteers: 0, guests: 0, nonVolunteers: 0 });
         e.total++;
         if (isVolunteer) e.volunteers++;
@@ -335,16 +340,33 @@ export class VisitController extends AttendanceBaseController {
     return null;
   }
 
+  // A visit from an earlier date is only a template for today's check-in. Drop its sessions for a
+  // service time whose check-in is closed right now (e.g. last Wednesday's rehearsal on a Monday),
+  // or the submit would carry them and be refused as notOpen. Today's visits are held and kept whole.
+  private async dropClosedTemplateSessions(churchId: string, visits: Visit[], currentDate: Date) {
+    const templates = visits.filter((v) => new Date(v.visitDate).toDateString() !== currentDate.toDateString());
+    const serviceTimeIds = [...new Set(templates.flatMap((v) => (v.visitSessions || []).map((vs) => vs.session?.serviceTimeId)).filter(Boolean))];
+    if (serviceTimeIds.length === 0) return;
+    const serviceTimes = (await this.repos.serviceTime.loadByIds(churchId, serviceTimeIds)) as (GateServiceTime & { id: string; serviceId?: string })[];
+    const scheduled = serviceTimes.filter((st) => CheckinGateHelper.hasSchedule(st));
+    if (scheduled.length === 0) return;
+    const zoneFor = await CheckinTimeZoneHelper.load(churchId, this.repos.service);
+    const now = new Date();
+    const closed = new Set(scheduled.filter((st) => !CheckinGateHelper.isServiceTimeOpen(st, now, zoneFor(st))).map((st) => st.id));
+    templates.forEach((v) => (v.visitSessions = v.visitSessions.filter((vs) => !closed.has(vs.session.serviceTimeId))));
+  }
+
   // Groups being checked into a service time whose scheduled check-in window is not open right now.
   private async findClosedServiceTimeGroups(churchId: string, serviceTimeGroups: Record<string, Set<string>>, groups: Record<string, GateGroup>) {
-    const serviceTimes = (await this.repos.serviceTime.loadByIds(churchId, Object.keys(serviceTimeGroups))) as (GateServiceTime & { id: string })[];
+    if (Object.keys(serviceTimeGroups).length === 0) return [];
+    const serviceTimes = (await this.repos.serviceTime.loadByIds(churchId, Object.keys(serviceTimeGroups))) as (GateServiceTime & { id: string; serviceId?: string })[];
     const scheduled = serviceTimes.filter((st) => CheckinGateHelper.hasSchedule(st));
     if (scheduled.length === 0) return [];
-    const timeZone = (await getMembershipModuleGateway().loadChurch(churchId))?.timeZone;
+    const zoneFor = await CheckinTimeZoneHelper.load(churchId, this.repos.service);
     const now = new Date();
     const result: { groupId: string; groupName: string; reason: "notOpen" }[] = [];
     scheduled.forEach((st) => {
-      if (CheckinGateHelper.isServiceTimeOpen(st, now, timeZone)) return;
+      if (CheckinGateHelper.isServiceTimeOpen(st, now, zoneFor(st))) return;
       serviceTimeGroups[st.id].forEach((groupId) => {
         if (!result.some((r) => r.groupId === groupId)) result.push({ groupId, groupName: groups[groupId]?.name ?? "", reason: "notOpen" });
       });

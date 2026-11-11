@@ -5,23 +5,29 @@ import express from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildMcpServer } from "./McpServer.js";
 import { LoginRateLimiter } from "../membership/helpers/LoginRateLimiter.js";
+import { protectedResourceMetadataUrl } from "./OAuthMetadata.js";
+import { McpPrincipal } from "./lessonsProxy.js";
 
 @controller("/mcp")
 export class McpController extends BaseHttpController {
   @httpPost("/")
   public async handle(req: express.Request, res: express.Response): Promise<void> {
-    const churchId = (this.httpContext?.user as any)?.details?.churchId;
+    const principal = (this.httpContext?.user as any)?.details as McpPrincipal | undefined;
+    const churchId = principal?.churchId;
     if (!churchId) {
+      // Points OAuth-capable clients (claude.ai, ChatGPT) at the sign-in discovery document.
+      res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${protectedResourceMetadataUrl()}"`);
+      res.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate");
       res.status(401).json({ error: "Unauthorized — MCP requires a valid bearer token (cak_* API key or JWT)." });
       return;
     }
 
-    // Stateless per-request server; API Gateway REST can't stream, so disable SSE.
+    // Stateless per-request server; API Gateway (REST and HTTP API alike) buffers responses, so disable SSE.
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true
     });
-    const server = buildMcpServer(req.headers.authorization as string | undefined, LoginRateLimiter.getClientIp(req));
+    const server = buildMcpServer(req.headers.authorization as string | undefined, LoginRateLimiter.getClientIp(req), principal);
 
     res.on("close", () => {
       transport.close().catch(() => {});

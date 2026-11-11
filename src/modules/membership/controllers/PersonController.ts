@@ -11,12 +11,29 @@ import { WebhookDispatcher } from "../../../shared/webhooks/index.js";
 import { AuthenticatedUser } from "@churchapps/apihelper";
 import { TransactionalEmailHelper } from "../../../shared/helpers/TransactionalEmailHelper.js";
 import { ContactVisibilityHelper } from "../helpers/ContactVisibilityHelper.js";
+import { GuestRegistrationHelper, type GuestAddress, type GuestFieldModes, type GuestMember } from "../helpers/GuestRegistrationHelper.js";
 import { MessagingSafetyHelper, type MessagingSafetyPerson } from "../../../shared/helpers/MessagingSafetyHelper.js";
 
 @controller("/membership/people")
 export class PersonController extends MembershipBaseController {
+  @httpGet("/guest-register/options")
+  public async guestRegisterOptions(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapperAnon(req, res, async () => {
+      // authz-exempt: anon read of the church's public sign-up checklist, behind the same binding and opt-in as the POST.
+      const claimedChurchId = req.query?.churchId?.toString();
+      const bind = PublicChurchContext.bind(req, claimedChurchId);
+      if (bind.mismatch) return this.json({ error: "churchId does not match site context" }, 401);
+      const churchId = bind.churchId || claimedChurchId;
+      if (!churchId) return this.json({ error: "churchId is required" }, 400);
+      const settings = await this.loadGuestRegistrationSettings(churchId);
+      if (!bind.churchId && !settings.enabled) return this.json({ error: "Guest registration is not enabled" }, 401);
+      if (!(await PublicPersonRateLimiter.allow(this.repos, LoginRateLimiter.getClientIp(req), churchId, "guest-register-options", 120))) return this.json({ error: "Too many requests" }, 429);
+      return settings.modes;
+    });
+  }
+
   @httpPost("/guest-register")
-  public async guestRegister(req: express.Request<{}, {}, { churchId: string, members: { firstName: string, lastName: string, email?: string, phone?: string }[], siteToken?: string }>, res: express.Response): Promise<any> {
+  public async guestRegister(req: express.Request<{}, {}, { churchId: string, members: GuestMember[], address?: GuestAddress, maritalStatus?: string, comments?: string, siteToken?: string }>, res: express.Response): Promise<any> {
     return this.actionWrapperAnon(req, res, async () => {
       // authz-exempt: anon endpoint; a claimed churchId is only honored once it matches the signed site/church token, or the church itself opted in via enableQRGuestRegistration.
       const claimedChurchId = req.body?.churchId;
@@ -24,15 +41,17 @@ export class PersonController extends MembershipBaseController {
       if (bind.mismatch) return this.json({ error: "churchId does not match site context" }, 401);
       const churchId = bind.churchId || claimedChurchId;
       if (!churchId) return this.json({ error: "churchId is required" }, 400);
-      if (!bind.churchId && !(await this.isGuestRegistrationEnabled(churchId))) return this.json({ error: "Guest registration is not enabled" }, 401);
+      const settings = await this.loadGuestRegistrationSettings(churchId);
+      if (!bind.churchId && !settings.enabled) return this.json({ error: "Guest registration is not enabled" }, 401);
       const members = req.body?.members;
       if (!members || !Array.isArray(members) || members.length === 0) return this.json({ error: "At least one member is required" }, 400);
       if (members.length > 10) return this.json({ error: "Maximum 10 members per registration" }, 400);
-      for (const m of members) {
-        if (!m.firstName || !m.lastName) return this.json({ error: "firstName and lastName are required for each member" }, 400);
-      }
+      // Fields the church turned off are dropped, even when the client sends them.
+      const { error, registration } = GuestRegistrationHelper.sanitize(req.body, settings.modes);
+      if (error) return this.json({ error }, 400);
       if (!(await PublicPersonRateLimiter.allow(this.repos, LoginRateLimiter.getClientIp(req), churchId, "guest-register"))) return this.json({ error: "Too many requests" }, 429);
-      return PersonHelper.registerGuestHousehold(churchId, members);
+      const { groupId, recordAttendance } = await this.loadGuestRegistrationGroup(churchId);
+      return PersonHelper.registerGuestHousehold(churchId, registration, groupId, recordAttendance);
     });
   }
 
@@ -100,6 +119,11 @@ export class PersonController extends MembershipBaseController {
   @httpGet("/recent")
   public async getRecent(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
+      // View Names wins over directory access so a member taking attendance can pick visitors.
+      if (!au.checkAccess(Permissions.people.view) && au.checkAccess(Permissions.people.viewNames)) {
+        const data = (await this.repos.person.loadRecent(au.churchId, true)) as any[];
+        return this.repos.person.convertAllToBasicModel(au.churchId, data);
+      }
       if (!au.checkAccess(Permissions.people.view) && !(await this.canViewDirectory(au))) return this.json({}, 401);
       else {
         const filterOptedOut = au.checkAccess(Permissions.server.admin) ? false : true;
@@ -136,6 +160,7 @@ export class PersonController extends MembershipBaseController {
   public async getHouseholdMembers(@requestParam("householdId") householdId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       const canView = au.checkAccess(Permissions.people.view) || au.checkAccess(Permissions.people.edit);
+      if (!canView && this.isCheckinOnly(au)) return this.repos.person.convertAllToCheckinModel(au.churchId, (await this.repos.person.loadByHousehold(au.churchId, householdId)) as any[]);
       if (!canView) {
         const self = au.personId ? await this.repos.person.load(au.churchId, au.personId) : null;
         if (!self || self.householdId !== householdId) return this.json({}, 401);
@@ -232,6 +257,10 @@ export class PersonController extends MembershipBaseController {
   @httpGet("/search/phone")
   public async searchPhone(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
+      if (this.isCheckinOnly(au)) {
+        const rows = (await this.repos.person.searchPhone(au.churchId, req.query.number?.toString() ?? "")) as any[];
+        return this.repos.person.convertAllToCheckinModel(au.churchId, rows.filter((p) => !p.optedOut));
+      }
       if (!au.checkAccess(Permissions.people.view) && !(await this.canViewDirectory(au))) return this.json({}, 401);
       else {
         const phoneNumber = req.query.number?.toString() ?? "";
@@ -263,6 +292,8 @@ export class PersonController extends MembershipBaseController {
   @httpGet("/search")
   public async search(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
+      if (this.isCheckinOnly(au)) return await this.searchCheckin(au, req.query);
+      if (!au.checkAccess(Permissions.people.view) && au.checkAccess(Permissions.people.viewNames)) return await this.searchNamesOnly(au, req.query);
       if (!au.checkAccess(Permissions.people.view) && !(await this.canViewDirectory(au))) return this.json({}, 401);
       else {
         let data = null;
@@ -278,6 +309,21 @@ export class PersonController extends MembershipBaseController {
         return await this.filterPeople(result, au);
       }
     });
+  }
+
+  // Checkin without View People: term search for the kiosk, adding what it needs to open the household and print labels
+  private async searchCheckin(au: AuthenticatedUser, params: any) {
+    if (params?.email) return [];
+    const data = await this.repos.person.search(au.churchId, params?.term?.toString() ?? "", true);
+    return this.repos.person.convertAllToCheckinModel(au.churchId, data);
+  }
+
+  // "View People Names Only": term search for pickers, returning only id, name, photo and status
+  private async searchNamesOnly(au: AuthenticatedUser, params: any) {
+    if (params?.email) return [];
+    const term = params?.term?.toString() ?? "";
+    const data = await this.repos.person.search(au.churchId, term, true);
+    return this.repos.person.convertAllToBasicModel(au.churchId, data);
   }
 
   @httpGet("/basic")
@@ -345,15 +391,22 @@ export class PersonController extends MembershipBaseController {
   @httpGet("/ids")
   public async getMultiple(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      if (!au.checkAccess(Permissions.people.view) && !(await this.canViewDirectory(au))) return this.json({}, 401);
-      else {
-        const idList = (req.query.ids?.toString() ?? "").split(",").filter(Boolean);
-        const ids: string[] = [];
-        idList.forEach((id) => ids.push(id));
-        const data = (await this.repos.person.loadByIds(au.churchId, ids)) as any[];
-        const result = this.repos.person.convertAllToModelWithPermissions(au.churchId, data, au.checkAccess(Permissions.people.edit));
-        return await this.filterPeople(result, au);
+      const canView = au.checkAccess(Permissions.people.view);
+      const canNames = au.checkAccess(Permissions.people.viewNames);
+      // View Names wins over directory access: attendance needs visitors, and this
+      // permission promises id, name and photo rather than a profile.
+      if (!canView && !canNames && !this.isCheckinOnly(au) && !(await this.canViewDirectory(au))) return this.json({}, 401);
+      const idList = (req.query.ids?.toString() ?? "").split(",").filter(Boolean);
+      const data = (await this.repos.person.loadByIds(au.churchId, idList)) as any[];
+      // Checkout loads checked-in people by id to find the household; directory opt-outs
+      // can be checked in (household load returns them), so they must come back here too.
+      if (this.isCheckinOnly(au)) return this.repos.person.convertAllToCheckinModel(au.churchId, data);
+      if (!canView && canNames) {
+        const visible = data.filter((p) => !p.optedOut || p.id === au.personId);
+        return this.repos.person.convertAllToBasicModel(au.churchId, visible);
       }
+      const result = this.repos.person.convertAllToModelWithPermissions(au.churchId, data, au.checkAccess(Permissions.people.edit));
+      return await this.filterPeople(result, au);
     });
   }
 
@@ -398,6 +451,7 @@ export class PersonController extends MembershipBaseController {
   @httpPost("/search")
   public async searchPost(req: express.Request<{}, {}, { email?: string; term?: string }>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
+      if (!au.checkAccess(Permissions.people.view) && au.checkAccess(Permissions.people.viewNames)) return await this.searchNamesOnly(au, req.body);
       if (!au.checkAccess(Permissions.people.view) && !(await this.canViewDirectory(au))) return this.json({}, 401);
       else {
         let data = null;
@@ -430,9 +484,10 @@ export class PersonController extends MembershipBaseController {
   public async advancedSearch(req: express.Request<{}, {}, SearchCondition[]>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.people.view) && !(await this.canViewDirectory(au))) return this.json({}, 401);
+      const conditions = req.body ?? [];
+      if (!Array.isArray(conditions)) return this.json({ error: "Expected an array of search conditions" }, 400);
       else {
         let data: any[] = (await this.repos.person.loadAll(au.churchId)) as any[];
-        const conditions = req.body ?? [];
         const fieldConditions = conditions.filter((c) => typeof c.field === "string" && c.field.startsWith("personField_"));
         const standardConditions = conditions.filter((c) => !(typeof c.field === "string" && c.field.startsWith("personField_")));
         if (fieldConditions.length) data = await ListRuleHelper.filterByFieldConditions(au.churchId, data, fieldConditions, this.repos);
@@ -440,6 +495,38 @@ export class PersonController extends MembershipBaseController {
         const result = this.repos.person.convertAllToModelWithPermissions(au.churchId, data, au.checkAccess(Permissions.people.edit));
         return await this.filterPeople(result, au);
       }
+    });
+  }
+
+  // A member's Add Family Member, for churches with no Directory Approval Group (where edits apply without review).
+  // The new person always lands in the caller's own household; churches that review changes get a task instead.
+  @httpPost("/familyMember")
+  public async addFamilyMember(req: express.Request<{}, {}, { first?: string, last?: string, prefix?: string, mobilePhone?: string, householdRole?: string }>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!au.checkAccess(Permissions.people.editSelf) || !au.personId) return this.json({}, 401);
+      const clean = (value: unknown, max: number) => (typeof value === "string" ? value.trim().slice(0, max) : "");
+      const first = clean(req.body?.first, 50);
+      if (!first) return this.json({ error: "first is required" }, 400);
+      const settings = this.repos.setting.convertAllToModel(au.churchId, (await this.repos.setting.loadPublicSettings(au.churchId)) as any[]) || [];
+      if (settings.some((s: any) => s.keyName === "directoryApprovalGroupId" && s.value)) return this.json({ error: "Family members are added through directory approval" }, 403);
+      const self = this.repos.person.convertToModel(au.churchId, await this.repos.person.load(au.churchId, au.personId));
+      if (!self?.householdId) return this.json({}, 401);
+      const role = clean(req.body?.householdRole, 10);
+      const last = clean(req.body?.last, 50) || self.name?.last || "";
+      const person: Person = {
+        churchId: au.churchId,
+        householdId: self.householdId,
+        householdRole: ["Head", "Spouse", "Child", "Other"].includes(role) ? role : "Other",
+        name: { first, last, display: [first, last].filter(Boolean).join(" ") },
+        contactInfo: {}
+      };
+      const prefix = clean(req.body?.prefix, 10);
+      if (prefix) person.name.prefix = prefix;
+      const mobilePhone = clean(req.body?.mobilePhone, 21);
+      if (mobilePhone) person.contactInfo.mobilePhone = mobilePhone;
+      const saved = await this.repos.person.save(person);
+      await WebhookDispatcher.emit(au.churchId, "person.created", saved);
+      return this.repos.person.convertToModelWithPermissions(au.churchId, saved, au.checkAccess(Permissions.people.edit));
     });
   }
 
@@ -619,7 +706,8 @@ export class PersonController extends MembershipBaseController {
     if (unique.length === 0) return [];
     const data = (await this.repos.person.loadByIds(au.churchId, unique)) as any[];
     const basic = this.repos.person.convertAllToBasicModel(au.churchId, data) as Person[];
-    return basic.map((p) => ({ id: p.id, name: { display: p.name?.display || "" }, photo: p.photo || "" }));
+    const rowById = new Map(data.map((d) => [d.id, d]));
+    return basic.map((p) => ({ id: p.id, name: { display: p.name?.display || "", first: rowById.get(p.id)?.firstName || "", last: rowById.get(p.id)?.lastName || "" }, photo: p.photo || "" }));
   }
 
   private async filterPeople(people: Person[], au: AuthenticatedUser) {
@@ -673,19 +761,39 @@ export class PersonController extends MembershipBaseController {
     return models;
   }
 
-  private async isGuestRegistrationEnabled(churchId: string): Promise<boolean> {
+  // One public-settings read gives both the opt-in switch and the sign-up checklist.
+  private async loadGuestRegistrationSettings(churchId: string): Promise<{ enabled: boolean, modes: GuestFieldModes }> {
     const church = await this.repos.church.loadById(churchId);
-    if (!church || church.archivedDate) return false;
+    if (!church || church.archivedDate) return { enabled: false, modes: GuestRegistrationHelper.parseModes(null) };
     const rows = this.repos.setting.convertAllToModel(churchId, (await this.repos.setting.loadPublicSettings(churchId)) as any[]);
     let enabled = false;
-    rows?.forEach((s: any) => { if (s.keyName === "enableQRGuestRegistration") enabled = s.value === "true"; });
-    return enabled;
+    let fields: string = null;
+    rows?.forEach((s: any) => {
+      if (s.keyName === "enableQRGuestRegistration") enabled = s.value === "true";
+      if (s.keyName === "guestRegistrationFields") fields = s.value;
+    });
+    return { enabled, modes: GuestRegistrationHelper.parseModes(fields) };
+  }
+
+  // The group and the record-attendance switch are private settings the admin picks, so a guest can never choose them.
+  private async loadGuestRegistrationGroup(churchId: string): Promise<{ groupId: string | undefined, recordAttendance: boolean }> {
+    const rows = (await this.repos.setting.loadAll(churchId)) as any[];
+    const groupId = rows?.find((s: any) => s.keyName === "guestRegistrationGroupId")?.value || undefined;
+    const recordAttendance = rows?.find((s: any) => s.keyName === "guestRegistrationRecordAttendance")?.value === "true";
+    return { groupId, recordAttendance };
+  }
+
+  // A check-in volunteer without View People gets the kiosk's scoped person reads (convertToCheckinModel).
+  private isCheckinOnly(au: AuthenticatedUser): boolean {
+    return !au.checkAccess(Permissions.people.view) && !au.checkAccess(Permissions.people.edit) && au.checkAccess(Permissions.attendance.checkin);
   }
 
   // The directory gate follows the church's configured directoryVisibility tier
   // (Staff / Members / Regular Attendees / Everyone), not a fixed Member-or-Staff check.
+  // "Staff" is labelled Admins Only: callers already let People View through, so nobody else gets in.
   private async canViewDirectory(au: AuthenticatedUser): Promise<boolean> {
     const directoryVisibility = await this.getDirectoryVisibilitySetting(au.churchId);
+    if (directoryVisibility === "Staff") return false;
     return this.shouldShowInDirectory(au.membershipStatus, directoryVisibility);
   }
 }

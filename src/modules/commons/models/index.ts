@@ -103,6 +103,8 @@ export interface SongView extends Song {
   id?: string;
   /** Opaque popularity/quality blend computed in SQL; the public song payloads sort on this instead of qualityScore. */
   rank?: number;
+  /** True when the LLM quality score is under the floor: kept, searchable, but off the home page and sorted last. */
+  demoted?: boolean;
   title?: string;
   themes?: string;
   language?: string;
@@ -209,6 +211,14 @@ export interface AssetFile {
   sizeBytes?: number;
   contentHash?: string;
   uploadedBy?: string;
+  createdAt?: Date;
+}
+
+/** A co-publisher of an asset; the primary publisher stays on assets.publisherUserId. */
+export interface AssetPublisher {
+  assetId?: string;
+  userId?: string;
+  addedBy?: string;
   createdAt?: Date;
 }
 

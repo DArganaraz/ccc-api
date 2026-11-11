@@ -31,6 +31,7 @@ export class PlanRepo {
       showVolunteerNames: model.showVolunteerNames,
       prepared: model.prepared,
       autoReplaceOnDecline: model.autoReplaceOnDecline,
+      confirmationWorkflowId: model.confirmationWorkflowId,
       lastAutofillRunId: model.lastAutofillRunId
     }).execute();
     return model;
@@ -54,7 +55,10 @@ export class PlanRepo {
       showVolunteerNames: model.showVolunteerNames,
       prepared: model.prepared,
       autoReplaceOnDecline: model.autoReplaceOnDecline,
-      lastAutofillRunId: model.lastAutofillRunId
+      confirmationWorkflowId: model.confirmationWorkflowId,
+      lastAutofillRunId: model.lastAutofillRunId,
+      // Only the Api writes a lesson trim warning (updateLessonTrimWarning); a client save can only dismiss it.
+      lessonTrimWarning: model.lessonTrimWarning === null ? null : undefined
     }).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
     return model;
   }
@@ -66,6 +70,10 @@ export class PlanRepo {
   // Targeted update — a full save() would round-trip serviceDate through toISOString.
   public async updateLastAutofillRunId(churchId: string, planId: string, runId: string | null) {
     await getDb().updateTable("plans").set({ lastAutofillRunId: runId }).where("id", "=", planId).where("churchId", "=", churchId).execute();
+  }
+
+  public async updateLessonTrimWarning(churchId: string, planId: string, lessonTrimWarning: string | null) {
+    await getDb().updateTable("plans").set({ lessonTrimWarning }).where("id", "=", planId).where("churchId", "=", churchId).execute();
   }
 
   public async updateNotes(churchId: string, planId: string, notes: string) {
@@ -126,10 +134,14 @@ export class PlanRepo {
     return getDb().selectFrom("plans as p")
       .innerJoin("positions as pos", (join) =>
         join.onRef("pos.planId", "=", "p.id").onRef("pos.churchId", "=", "p.churchId"))
+      .leftJoin("planTypes as pt", (join) =>
+        join.onRef("pt.id", "=", "p.planTypeId").onRef("pt.churchId", "=", "p.churchId"))
       .selectAll("p")
       .distinct()
       .where("p.churchId", "=", churchId)
       .where("pos.allowSelfSignup", "=", true as any)
+      // Plans whose type was deleted are orphaned; plans that never had a type still show (#1324).
+      .where((eb) => eb.or([eb("p.planTypeId", "is", null), eb("pt.id", "is not", null)]))
       .where((eb) => eb.or([eb("p.prepared", "is", null), eb("p.prepared", "=", false as any)]))
       .where("p.serviceDate", ">=", sql`CURDATE()` as any)
       .orderBy("p.serviceDate", "asc")

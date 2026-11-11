@@ -10,6 +10,8 @@ import axios from "axios";
 import { Environment } from "../../../shared/helpers/Environment.js";
 import { RepoManager } from "../../../shared/infrastructure/RepoManager.js";
 import { ChurchEmailLimiter } from "../../../shared/helpers/ChurchEmailLimiter.js";
+import { TransactionalEmailHelper } from "../../../shared/helpers/TransactionalEmailHelper.js";
+import { getMembershipModuleGateway } from "../../../shared/modules/MembershipModuleGateway.js";
 
 export interface NotificationDebugStep {
   step: string;
@@ -23,6 +25,7 @@ export interface NotificationDebugTrace {
 
 export interface CreateNotificationOptions {
   deliveryStartLevel?: number;
+  appOnly?: boolean; // app alert whose confirmation workflow owns email/SMS
   deliveryTitle?: string;
   navData?: Record<string, unknown>;
   category?: string; // preference opt-out axis (architecture §2.6); derived if omitted
@@ -246,7 +249,7 @@ export class NotificationHelper {
         const expoPushTokens = [...new Set(allTokens.filter((token) => token.startsWith("ExponentPushToken[")))];
         const { activeTokens: webPushTokens, staleTokens: staleWebPushTokens, activeDevices: activeWebPushDevices } = this.prepareWebPushDevices(devices);
         const deviceTokenDebug = devices.map((device) => this.summarizePushDeviceForDebug(device));
-        console.info("[chat-push] devices loaded", {
+        console.debug("[chat-push] devices loaded", {
           churchId,
           personId,
           contentType,
@@ -511,7 +514,7 @@ export class NotificationHelper {
         const recipientDevices = pm.notifyPersonId
           ? await NotificationHelper.repos.device.loadForPerson(conversation.churchId, pm.notifyPersonId) as any[]
           : [];
-        console.info("[chat-push] targets", {
+        console.debug("[chat-push] targets", {
           churchId: conversation.churchId,
           conversationId: conversation.id,
           senderPersonId,
@@ -619,7 +622,7 @@ export class NotificationHelper {
         const recipientDevices = subscribers.length > 0
           ? ((await Promise.all(subscribers.map((personId) => NotificationHelper.repos.device.loadForPerson(conversation.churchId, personId)))) as any[][]).flat()
           : [];
-        console.info("[chat-push] targets", {
+        console.debug("[chat-push] targets", {
           churchId: conversation.churchId,
           conversationId: conversation.id,
           senderPersonId,
@@ -630,7 +633,8 @@ export class NotificationHelper {
         });
         if (subscribers.length > 0) {
           const title = await NotificationHelper.resolveConversationTitle(conversation);
-          await this.createNotifications(subscribers, conversation.churchId, conversation.contentType, conversation.contentId, "New message: " + title, undefined, senderPersonId);
+          const link = await NotificationHelper.resolveNoteLink(conversation);
+          await this.createNotifications(subscribers, conversation.churchId, conversation.contentType, conversation.contentId, title ? "New message: " + title : "New message", link, senderPersonId);
         }
         break;
       }
@@ -672,7 +676,7 @@ export class NotificationHelper {
         }
       }
       if (suppressedPersonIds.length > 0) {
-        console.info("[chat-push] notification suppressed by unread existing", {
+        console.debug("[chat-push] notification suppressed by unread existing", {
           churchId,
           contentType,
           contentId,
@@ -704,7 +708,7 @@ export class NotificationHelper {
           const deliveryMethod = await NotificationHelper.attemptDeliveryWithEscalation(
             n.churchId,
             n.personId,
-            options?.deliveryStartLevel ?? 0,
+            options?.appOnly ? 1 : (options?.deliveryStartLevel ?? 0),
             options?.deliveryTitle || title,
             n.message,
             "notification",
@@ -713,7 +717,7 @@ export class NotificationHelper {
             n.category
           );
 
-          notification.deliveryMethod = deliveryMethod;
+          notification.deliveryMethod = options?.appOnly ? "complete" : deliveryMethod;
           // Muted rows parked: isNew=false keeps out of badge counts and stops escalation.
           if (deliveryMethod === "muted") notification.isNew = false;
           await NotificationHelper.repos.notification.save(notification);
@@ -760,7 +764,7 @@ export class NotificationHelper {
     }
 
     try {
-      await EmailHelper.sendTemplatedEmail("support@churchapps.org", email, "B1.church", "https://admin.b1.church", subject, html, "ChurchEmailTemplate.html");
+      await EmailHelper.sendTemplatedEmail(await this.churchFrom(notification.churchId), email, "B1.church", "https://admin.b1.church", subject, html, "ChurchEmailTemplate.html");
       if (reservationId) await ChurchEmailLimiter.settle(notification.churchId, reservationId, true);
       else await this.logDelivery(notification.churchId, notification.personId, "notification", notification.id, "email", true, email);
       notification.deliveryMethod = "complete";
@@ -770,6 +774,37 @@ export class NotificationHelper {
       else await this.logDelivery(notification.churchId, notification.personId, "notification", notification.id, "email", false, email, String(e));
     }
   };
+
+  // A durable workflow owns dedup and response-aware retries. Send one gated email
+  // attempt here, without leaving an unread/digest queue entry after the request ends.
+  static async sendWorkflowEmail(churchId: string, personId: string, taskId: string, email: string, subject: string, html: string): Promise<string> {
+    this.ensureInitialized();
+    if (!(await this.peopleInChurch(churchId, [personId])).includes(personId)) return "skipped (person is not in this church)";
+    const pref = await this.repos.notificationPreference.loadByPersonId(churchId, personId);
+    const overrides = await this.repos.notificationPreferenceOverride.loadForPerson(churchId, personId);
+    const gate = PreferenceGateHelper.evaluate(churchId, personId, "serving_schedule", "email", { pref, overrides });
+    if (!gate.allow) return `skipped (${gate.reason || gate.decision})`;
+    const reservation = await ChurchEmailLimiter.reserve(churchId, "workflowEmail", [{ address: email, personId, contentId: taskId }]);
+    if (!reservation) return "blocked (church email approval or daily limit)";
+    try {
+      await EmailHelper.sendTemplatedEmail(await this.churchFrom(churchId), email, "B1.church", "https://admin.b1.church", subject, html, "ChurchEmailTemplate.html");
+      await ChurchEmailLimiter.settle(churchId, reservation[0], true);
+      return "sent";
+    } catch (err) {
+      await ChurchEmailLimiter.settle(churchId, reservation[0], false, String(err));
+      throw err;
+    }
+  }
+
+  // Sender shows the church's name; a failed lookup falls back to the bare support address.
+  private static async churchFrom(churchId: string): Promise<string> {
+    try {
+      const church = await getMembershipModuleGateway().loadChurch(churchId);
+      return TransactionalEmailHelper.fromAddress(church?.name);
+    } catch {
+      return TransactionalEmailHelper.fromAddress();
+    }
+  }
 
   // Legacy push paths (§4.5) route through gate so opt-outs/master-mute/quiet-hours honored.
   private static pushAllowed = async (churchId: string, personId: string, category: string): Promise<boolean> => {
@@ -957,6 +992,29 @@ export class NotificationHelper {
     }
   };
 
+  // Where a note was written, matching B1Admin's Notes feed (#1495). Group notes open in the app; the rest only exist in B1 Admin.
+  static resolveNoteLink = async (conversation: Conversation): Promise<string | undefined> => {
+    const id = conversation.contentId;
+    if (!id) return undefined;
+    const adminRoot = (Environment.b1AdminRoot || "https://admin.b1.church").replace(/\/$/, "");
+    switch (conversation.contentType) {
+      case "groupNote": return `/mobile/groups/${id}?openChat=1&chatTab=notes`;
+      case "person":
+      case "personConfidential": return `${adminRoot}/people/${id}?view=notes`;
+      case "workflowCard": return `${adminRoot}/serving/tasks/${id}`;
+      case "eventNote": {
+        try {
+          const { getContentModuleGateway } = await import("../../../shared/modules/ContentModuleGateway.js");
+          const event = await getContentModuleGateway().loadEvent(conversation.churchId, id);
+          return event?.groupId ? `${adminRoot}/groups/${event.groupId}?view=calendar` : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      default: return undefined;
+    }
+  };
+
   static peopleInChurch = async (churchId: string, peopleIds: string[]): Promise<string[]> => {
     if (!churchId || !peopleIds.length) return [];
     const membershipRepos = await RepoManager.getRepos<any>("membership");
@@ -992,13 +1050,17 @@ export class NotificationHelper {
         title = firstNotification.message;
         content = NotificationHelper.escapeHtml(firstNotification.message);
       } else if (firstNotification.message.includes("Volunteer Requests:")) {
-        const match = firstNotification.message.match(/Volunteer Requests:(.*).Please log in and confirm/);
+        const match = firstNotification.message.match(/Volunteer Requests:\s*(.*?)\s*Please log in and confirm/);
         title = "New Notification: Volunteer Request";
-        content = "<h3>New Notification</h3><h4>Volunteer Request</h4><h4>" + NotificationHelper.escapeHtml(match ? match[1] : firstNotification.message) + "</h4>" +
+        content = [
+          "<h3>New Notification</h3>",
+          "<h4>Volunteer Request</h4>",
+          "<h4>" + NotificationHelper.escapeHtml(match ? match[1].trim() : firstNotification.message) + "</h4>",
           (/^https?:\/\//i.test(firstNotification.link || "")
             ? "<a href='" + NotificationHelper.escapeHtml(firstNotification.link) + "' target='_blank'><button style='background-color: #0288d1; border:2px solid #0288d1; border-radius: 5px; color:white; cursor: pointer; padding: 5px'>View Details</button></a>"
-            : "") +
-          "<p>Please log in and confirm</p>";
+            : ""),
+          "<p>Please log in and confirm</p>"
+        ].filter(Boolean).join("\n");
       } else {
         title = "New Notification: " + firstNotification.message;
         content = "New Notification: " + NotificationHelper.escapeHtml(firstNotification.message);
@@ -1014,9 +1076,10 @@ export class NotificationHelper {
     // Delivered once any address got it; retrying the batch would re-send to the ones that succeeded.
     let emailSuccess = false;
     let emailError: string | undefined;
+    const from = await NotificationHelper.churchFrom(firstNotification.churchId);
     for (const address of addresses) {
       try {
-        await EmailHelper.sendTemplatedEmail("support@churchapps.org", address, "B1.church", "https://admin.b1.church", title, content, "ChurchEmailTemplate.html", replyTo);
+        await EmailHelper.sendTemplatedEmail(from, address, "B1.church", "https://admin.b1.church", title, content, "ChurchEmailTemplate.html", replyTo);
         emailSuccess = true;
       } catch (error) {
         emailError = String(error);

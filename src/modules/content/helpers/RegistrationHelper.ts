@@ -55,7 +55,7 @@ export class RegistrationHelper {
       <p>If you need to cancel your registration, please visit the church website or contact the church office.</p>
     `;
 
-    await TransactionalEmailHelper.sendTransactional(Environment.supportEmail, email, churchName, siteUrl || Environment.b1AdminRoot, "Registration Confirmed: " + event.title, contents);
+    await TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(churchName), email, churchName, siteUrl || Environment.b1AdminRoot, "Registration Confirmed: " + event.title, contents);
   }
 
   static async sendWaitlistAvailabilityEmail(email: string, churchName: string, event: Event, payUrl?: string) {
@@ -71,7 +71,7 @@ export class RegistrationHelper {
       ${payLine}
     `;
 
-    await TransactionalEmailHelper.sendTransactional(Environment.supportEmail, email, churchName, Environment.b1AdminRoot, "Spot Available: " + event.title, contents);
+    await TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(churchName), email, churchName, Environment.b1AdminRoot, "Spot Available: " + event.title, contents);
   }
 
   static async sendCancellationEmail(email: string, churchName: string, event: Event) {
@@ -83,6 +83,6 @@ export class RegistrationHelper {
       <p>If this was a mistake, please register again on the church website or contact the church office.</p>
     `;
 
-    await TransactionalEmailHelper.sendTransactional(Environment.supportEmail, email, churchName, Environment.b1AdminRoot, "Registration Cancelled: " + event.title, contents);
+    await TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(churchName), email, churchName, Environment.b1AdminRoot, "Registration Cancelled: " + event.title, contents);
   }
 }

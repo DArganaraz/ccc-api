@@ -36,7 +36,8 @@ export class MauticHelper {
       await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
       return MauticHelper.request(method, path, body, attempt + 1);
     }
-    if (!res.ok) throw new Error(`Mautic ${path} failed: ${res.status} ${await res.text()}`);
+    // The query string can hold a contact's email (contacts?search=), so it stays out of the logged message.
+    if (!res.ok) throw new Error(`Mautic ${path.split("?")[0]} failed: ${res.status} ${await res.text()}`);
     return res.json();
   };
 
@@ -61,7 +62,8 @@ export class MauticHelper {
 
     const companyPayload = {
       companyname: companyName,
-      companyaddress1: address,
+      // Mautic rejects the whole company (400) when companyaddress1 is over 64 characters.
+      companyaddress1: address?.substring(0, 64),
       companycity: city,
       companystate: state,
       companyzipcode: zip,
@@ -74,7 +76,8 @@ export class MauticHelper {
       firstname: firstName,
       lastname: lastName,
       email,
-      address1: address,
+      // Same 64-character limit as companyaddress1.
+      address1: address?.substring(0, 64),
       city,
       state,
       zipcode: zip,

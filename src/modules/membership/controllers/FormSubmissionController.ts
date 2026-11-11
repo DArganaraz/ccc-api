@@ -9,17 +9,77 @@ import { WebhookDispatcher } from "../../../shared/webhooks/index.js";
 import { TransactionalEmailHelper } from "../../../shared/helpers/TransactionalEmailHelper.js";
 import { ChurchEmailLimiter } from "../../../shared/helpers/ChurchEmailLimiter.js";
 import { NotificationService } from "../../../shared/helpers/NotificationService.js";
+import { getContentModuleGateway } from "../../../shared/modules/index.js";
+import type { AuthenticatedUser } from "@churchapps/apihelper";
 
 @controller("/membership/formsubmissions")
 export class FormSubmissionController extends MembershipBaseController {
+  // Self-scoped: stand-alone forms the signed-in member submitted or an admin assigned to them. Person forms (staff fill those in about someone) are left out by the repo.
+  @httpGet("/my")
+  public async getMy(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!au.personId) return this.json([], 401);
+      const result: FormSubmission[] = this.repos.formSubmission.convertAllToModel(au.churchId, (await this.repos.formSubmission.loadForSubmitter(au.churchId, au.personId)) as any[]);
+      if (result.length === 0) return result;
+      if (this.include(req, "questions")) {
+        const questionsByForm: Record<string, Question[]> = {};
+        for (const formId of Array.from(new Set(result.map((s) => s.formId)))) {
+          questionsByForm[formId] = this.repos.question.convertAllToModel(au.churchId, (await this.repos.question.loadForForm(au.churchId, formId)) as any[]);
+        }
+        result.forEach((s) => { s.questions = questionsByForm[s.formId]; });
+      }
+      if (this.include(req, "answers")) {
+        const answers: Answer[] = this.repos.answer.convertAllToModel(au.churchId, (await this.repos.answer.loadForFormSubmissions(au.churchId, result.map((s) => s.id))) as any[]);
+        result.forEach((s) => { s.answers = answers.filter((a) => a.formSubmissionId === s.id); });
+      }
+      return result;
+    });
+  }
+
   @httpGet("/:id")
   public async get(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      if (!au.checkAccess(Permissions.forms.admin) && !au.checkAccess(Permissions.forms.edit)) return this.json({}, 401);
       const result: FormSubmission = this.repos.formSubmission.convertToModel(au.churchId, await this.repos.formSubmission.load(au.churchId, id));
+      if (!au.checkAccess(Permissions.forms.admin) && !au.checkAccess(Permissions.forms.edit) && !(await this.canViewSubmission(au, result))) return this.json({}, 401);
       if (this.include(req, "form")) await this.appendForm(au.churchId, result);
       if (this.include(req, "questions")) await this.appendQuestions(au.churchId, result);
       if (this.include(req, "answers")) await this.appendAnswers(au.churchId, result);
+      return result;
+    });
+  }
+
+  // Leader-only: answers to the forms linked to this group and to the registration forms of its events.
+  @httpGet("/group/:groupId")
+  public async getForGroup(@requestParam("groupId") groupId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!this.leadsGroup(au, groupId)) return this.json([], 401);
+      const result: { form: Form; event?: { id: string; title: string; start: Date }; questions: Question[]; submissions: FormSubmission[] }[] = [];
+      const forms: Form[] = this.repos.form.convertAllToModel(au.churchId, (await this.repos.form.loadForGroup(au.churchId, groupId)) as any[]);
+      for (const form of forms) {
+        const submissions = this.repos.formSubmission.convertAllToModel(au.churchId, (await this.repos.formSubmission.loadByFormId(au.churchId, form.id)) as any[]);
+        result.push({ form, questions: [], submissions });
+      }
+      const events = await getContentModuleGateway().loadEventsForGroup(au.churchId, groupId);
+      for (const event of events) {
+        const form = this.repos.form.convertToModel(au.churchId, await this.repos.form.load(au.churchId, event.formId));
+        if (!form) continue;
+        const rows = (await this.repos.formSubmission.loadForContent(au.churchId, "event", event.id)) as any[];
+        const submissions = this.repos.formSubmission.convertAllToModel(au.churchId, rows.filter((r) => r.formId === form.id));
+        result.push({ form, event: { id: event.id, title: event.title, start: event.start }, questions: [], submissions });
+      }
+      const allSubmissions = result.flatMap((r) => r.submissions);
+      const answers: Answer[] = allSubmissions.length === 0 ? [] : this.repos.answer.convertAllToModel(au.churchId, (await this.repos.answer.loadForFormSubmissions(au.churchId, allSubmissions.map((s) => s.id))) as any[]);
+      // Leaders can't list people, so name each submitter here.
+      const personIdOf = (s: FormSubmission) => (s.contentType === "person" ? s.contentId : s.submittedBy);
+      const personIds = Array.from(new Set(allSubmissions.map(personIdOf).filter(Boolean)));
+      const people = personIds.length === 0 ? [] : ((await this.repos.person.loadByIds(au.churchId, personIds)) as any[]);
+      for (const r of result) {
+        r.questions = this.repos.question.convertAllToModel(au.churchId, (await this.repos.question.loadForForm(au.churchId, r.form.id)) as any[]);
+        r.submissions.forEach((s) => {
+          s.answers = answers.filter((a) => a.formSubmissionId === s.id);
+          (s as any).personName = people.find((p) => p.id === personIdOf(s) && !p.removed)?.displayName || null;
+        });
+      }
       return result;
     });
   }
@@ -58,7 +118,7 @@ export class FormSubmissionController extends MembershipBaseController {
     });
   }
 
-  // authz-exempt: open form submission — public forms accept any submitter; restricted forms gated by this.formAccess(au, formId), churchId derived from the loaded form not the request
+  // authz-exempt: open form submission — public forms accept any submitter; restricted forms need a signed-in user of the form's church (or form access), churchId derived from the loaded form not the request
   @httpPost("/")
   public async save(req: express.Request<{}, {}, FormSubmission[]>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
@@ -73,11 +133,14 @@ export class FormSubmissionController extends MembershipBaseController {
 
           if (!form || !churchId) {
             results.push({ error: `Form with id ${formId} not found` });
-          } else if (form.restricted && !(await this.formAccess(au, formId))) {
+          } else if (form.restricted && !((au?.id && au?.churchId === churchId) || (await this.formAccess(au, formId)))) {
+            // Restricted means signed-in people of the form's church may fill it out, not only form managers.
             results.push({ error: `You're not allowed to submit ${form.name}` });
           } else {
             formSubmission.churchId = churchId;
             const canManage = au?.churchId === churchId && (await this.formAccess(au, formId));
+            // submittedBy grants the member read access through /my, so only managers may set it to someone else.
+            if (!canManage) formSubmission.submittedBy = (au?.churchId === churchId && au?.personId) || null;
             if (!canManage && !this.isWithinAccessWindow(form)) {
               results.push({ error: `${form.name} is not accepting submissions` });
               continue;
@@ -119,7 +182,8 @@ export class FormSubmissionController extends MembershipBaseController {
               }
             }
 
-            if (form.groupId && formSubmission.contentType === "person" && formSubmission.contentId) {
+            // A linked group also shows the form on that group page; only person-creating forms add submitters to it.
+            if (wantsPerson && form.groupId && formSubmission.contentType === "person" && formSubmission.contentId) {
               try {
                 await this.addToGroup(churchId, form.groupId, formSubmission.contentId);
               } catch (err) {
@@ -187,6 +251,15 @@ export class FormSubmissionController extends MembershipBaseController {
     });
   }
 
+  // Group leaders read answers to forms linked to their group (formAccess "view") and to their group's event registrations.
+  private async canViewSubmission(au: AuthenticatedUser, submission: FormSubmission) {
+    if (!submission) return false;
+    if (await this.formAccess(au, submission.formId, "view")) return true;
+    if (submission.contentType !== "event" || !submission.contentId) return false;
+    const event = await getContentModuleGateway().loadEvent(au.churchId, submission.contentId);
+    return !!event && event.formId === submission.formId && this.leadsGroup(au, event.groupId);
+  }
+
   private isWithinAccessWindow(form: Form) {
     const day = 24 * 60 * 60 * 1000;
     const now = Date.now();
@@ -227,7 +300,7 @@ export class FormSubmissionController extends MembershipBaseController {
           const contents = "<table role=\"presentation\" style=\"text-align: left;\" cellspacing=\"8\" width=\"80%\"><tablebody>" + contentRows.join(" ") + "</tablebody></table>";
           const promises: Promise<any>[] = [];
           (people as any[]).forEach((p: Person) => {
-            if (p.email) promises.push(TransactionalEmailHelper.sendTransactional(Environment.supportEmail, p.email, church.name, Environment.b1AdminRoot, "New Submissions for " + form.name, contents));
+            if (p.email) promises.push(TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(church.name), p.email, church.name, Environment.b1AdminRoot, "New Submissions for " + form.name, contents));
           });
           promises.push(this.sendNotifications(churchId, form, people.map((p: Person) => p.id)));
           await Promise.all(promises);
@@ -244,7 +317,7 @@ export class FormSubmissionController extends MembershipBaseController {
     const resolvedSubject = ConversationalFormHelper.applyTokens(subject, tokens);
     const resolvedBody = ConversationalFormHelper.applyTokens(body, tokens);
     try {
-      await TransactionalEmailHelper.sendTransactional(Environment.supportEmail, email, church?.name, Environment.b1AdminRoot, resolvedSubject, resolvedBody, "ChurchEmailTemplate.html");
+      await TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(church?.name), email, church?.name, Environment.b1AdminRoot, resolvedSubject, resolvedBody, "ChurchEmailTemplate.html");
       await ChurchEmailLimiter.settle(churchId, reserved[0], true);
     } catch (err: any) {
       await ChurchEmailLimiter.settle(churchId, reserved[0], false, err?.message || "Send failed");

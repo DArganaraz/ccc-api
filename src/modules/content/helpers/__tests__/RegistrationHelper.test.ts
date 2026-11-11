@@ -1,5 +1,5 @@
 const sendTransactional = jest.fn();
-jest.mock("../../../../shared/helpers/TransactionalEmailHelper", () => ({ TransactionalEmailHelper: { sendTransactional: (...args: any[]) => sendTransactional(...args) } }));
+jest.mock("../../../../shared/helpers/TransactionalEmailHelper", () => ({ TransactionalEmailHelper: { fromAddress: (name: string) => name + " <s@test>", sendTransactional: (...args: any[]) => sendTransactional(...args) } }));
 jest.mock("../../../../shared/helpers/Environment", () => ({ Environment: { b1AdminRoot: "https://admin.test", b1AppRoot: "https://{subdomain}.site.test/", supportEmail: "s@test" } }));
 
 import { RegistrationHelper } from "../RegistrationHelper.js";

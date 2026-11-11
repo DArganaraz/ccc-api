@@ -1,3 +1,5 @@
+jest.mock("../../../shared/helpers/Environment.js", () => ({ Environment: {} }));
+
 import { dispatch, setExpressApp } from "../internalDispatch.js";
 import { makeApiCallHandler } from "../tools/apiCall.js";
 import { LoginRateLimiter } from "../../membership/helpers/LoginRateLimiter.js";
@@ -23,6 +25,14 @@ describe("MCP api_call", () => {
   });
 
   it.each(["/membership/users/login", "/membership/users/verifyCode", "/membership/users/forgot", "/membership/users/register", "/mcp"])("refuses credential endpoint %s", async (path) => {
+    seenIp = "untouched";
+    const handler = makeApiCallHandler(() => "Bearer x", () => "198.51.100.4");
+    const result: any = await handler({ method: "POST", path });
+    expect(result.isError).toBe(true);
+    expect(seenIp).toBe("untouched");
+  });
+
+  it.each(["/membership/users/mfa/status", "/membership/users/mfa/setup", "/membership/users/mfa/enable", "/membership/users/mfa/disable", "/membership/users/mfa/reset/u1"])("refuses the two-factor endpoint %s", async (path) => {
     seenIp = "untouched";
     const handler = makeApiCallHandler(() => "Bearer x", () => "198.51.100.4");
     const result: any = await handler({ method: "POST", path });

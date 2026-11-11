@@ -13,6 +13,8 @@ export class MessageRepo {
 
   private async create(model: Message): Promise<Message> {
     model.id = UniqueIdHelper.shortId();
+    // The saved model is returned and broadcast, so it carries the send time clients sort by.
+    model.timeSent = new Date();
     await retryOnDeadlock(() => getDb().insertInto("messages").values({
       id: model.id,
       churchId: model.churchId,
@@ -31,8 +33,10 @@ export class MessageRepo {
       personId: model.personId,
       displayName: model.displayName,
       content: model.content,
-      timeUpdated: model.timeUpdated
+      timeUpdated: sql`NOW()`
     }).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
+    // The saved model is what gets broadcast, so it carries the edit time for the "(edited)" marker.
+    model.timeUpdated = new Date();
     return model;
   }
 

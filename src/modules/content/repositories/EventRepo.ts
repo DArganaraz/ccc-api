@@ -38,7 +38,9 @@ export class EventRepo {
       approvalStatus: m.approvalStatus,
       requestedBy: m.requestedBy,
       rsvpDisabled: m.rsvpDisabled ?? false,
-      photoUrl: m.photoUrl
+      photoUrl: m.photoUrl,
+      notesViewRole: m.notesViewRole || null,
+      notesPostRole: m.notesPostRole || null
     } as any).execute();
     return model;
   }
@@ -69,7 +71,9 @@ export class EventRepo {
       requestedBy: m.requestedBy,
       // explicit false so un-disabling RSVP persists (Kysely drops undefined)
       rsvpDisabled: m.rsvpDisabled ?? false,
-      photoUrl: m.photoUrl
+      photoUrl: m.photoUrl,
+      notesViewRole: m.notesViewRole || null,
+      notesPostRole: m.notesPostRole || null
     } as any).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
     return model;
   }
@@ -123,6 +127,14 @@ export class EventRepo {
       .where("churchId", "=", churchId)
       .where("approvalStatus", "=", "pending")
       .orderBy("start").execute() as any;
+  }
+
+  // Approved and rejected event requests for the approvals history, newest first.
+  public async loadResolved(churchId: string): Promise<Event[]> {
+    return getDb().selectFrom("events").selectAll()
+      .where("churchId", "=", churchId)
+      .where("approvalStatus", "in", ["approved", "rejected"])
+      .orderBy("start", "desc").execute() as any;
   }
 
   // Events with an approved booking for the room, for per-room iCal feeds.
@@ -211,7 +223,9 @@ export class EventRepo {
       approvalStatus: row.approvalStatus,
       requestedBy: row.requestedBy,
       rsvpDisabled: row.rsvpDisabled,
-      photoUrl: row.photoUrl
+      photoUrl: row.photoUrl,
+      notesViewRole: row.notesViewRole,
+      notesPostRole: row.notesPostRole
     };
   }
 }

@@ -3,7 +3,10 @@ import crypto from "crypto";
 
 const mockExchange = jest.fn();
 const mockRefresh = jest.fn();
+const mockAllow = jest.fn(async () => true);
 jest.mock("../MembershipBaseController", () => ({ MembershipBaseController: class {} }));
+jest.mock("../../helpers/PublicPersonRateLimiter.js", () => ({ PublicPersonRateLimiter: { allow: (...args: unknown[]) => mockAllow(...(args as [])) } }));
+jest.mock("../../helpers/LoginRateLimiter.js", () => ({ LoginRateLimiter: { getClientIp: () => "203.0.113.9" } }));
 jest.mock("@churchapps/content-providers", () => ({
   setProviderSecret: jest.fn(),
   getProvider: jest.fn(() => ({ exchangeCodeForTokens: (...args: unknown[]) => mockExchange(...args) })),
@@ -86,5 +89,30 @@ describe("ProviderRelayTokenController", () => {
     const denied: any = await controller.refresh({ body: { provider: "gocurriculum", refreshToken: "refresh-1" } } as any, {} as any);
     expect(denied.status).toBe(400);
     expect(denied.obj.error).toBe("unsupported_provider");
+  });
+
+  it("stops asking Go about catalog tokens once a caller goes over the limit", async () => {
+    const getCatalog = jest.fn(async () => ({ catalog: [] as unknown[] }));
+    (getProvider as jest.Mock).mockReturnValue({ getCatalog });
+    mockAllow.mockResolvedValueOnce(false);
+    const { controller, repos } = harness({});
+    const result: any = await controller.goCurriculumCatalog({ body: { groupId: "elementary", accessToken: "guess" } } as any, {} as any);
+    expect(result.status).toBe(429);
+    expect(getCatalog).not.toHaveBeenCalled();
+    expect(mockAllow).toHaveBeenCalledWith(repos, "203.0.113.9", "", "go-catalog", 300, 3600);
+  });
+
+  it("serves the Go catalog only for a token Go verifies", async () => {
+    const getCatalog = jest.fn(async (groupId: string, auth: any) => (auth.access_token === "good" ? { catalog: [{ id: groupId }] } : null));
+    (getProvider as jest.Mock).mockReturnValue({ getCatalog });
+    process.env.GOCURRICULUM_FEEDS = "{\"elementary\":\"https://feeds.test/e\"}";
+    const { controller } = harness(null);
+    const ok: any = await controller.goCurriculumCatalog({ body: { groupId: "elementary", accessToken: "good" } } as any, {} as any);
+    expect(ok).toEqual({ obj: { catalog: [{ id: "elementary" }] }, status: 200 });
+    expect(setProviderSecret).toHaveBeenCalledWith("gocurriculumFeeds", process.env.GOCURRICULUM_FEEDS);
+    const bad: any = await controller.goCurriculumCatalog({ body: { groupId: "elementary", accessToken: "bad" } } as any, {} as any);
+    expect(bad.status).toBe(404);
+    const missing: any = await controller.goCurriculumCatalog({ body: { groupId: "elementary" } } as any, {} as any);
+    expect(missing.status).toBe(400);
   });
 });

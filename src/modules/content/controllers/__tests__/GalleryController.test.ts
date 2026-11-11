@@ -116,6 +116,17 @@ describe("GalleryController disk store", () => {
     expect(AwsHelper.S3PresignedUrl).not.toHaveBeenCalled();
   });
 
+  it("builds the upload url from CONTENT_ROOT so a path prefix like /api survives the proxy", async () => {
+    (Environment as any).contentRoot = "https://my.example.org/api/content";
+    try {
+      const { controller } = makeController({ access: ["contentEdit"] });
+      const result: any = await requestUpload(controller, { folder: "1.78", fileName: "1.jpg", contentType: "image/jpeg" });
+      expect(result.url).toMatch(/^https:\/\/my\.example\.org\/api\/content\/gallery\/upload\?key=/);
+    } finally {
+      delete (Environment as any).contentRoot;
+    }
+  });
+
   it("only accepts images, even from content editors, because disk files are served from the api origin", async () => {
     const { controller } = makeController({ access: ["contentEdit"] });
     expect((await requestUpload(controller, { folder: "0", fileName: "page.html" }) as any).status).toBe(400);

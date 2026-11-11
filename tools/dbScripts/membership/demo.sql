@@ -16,6 +16,9 @@ BEGIN
     TRUNCATE TABLE rolePermissions;
     TRUNCATE TABLE roles;
     TRUNCATE TABLE users;
+    IF EXISTS (SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'userMfa') THEN
+        TRUNCATE TABLE userMfa;
+    END IF;
     TRUNCATE TABLE userChurches;
     TRUNCATE TABLE groupMembers;
     TRUNCATE TABLE groupMemberHistory;
@@ -506,6 +509,36 @@ INSERT INTO userChurches (id, userId, churchId, personId) VALUES
 
 INSERT INTO roleMembers (id, churchId, roleId, userId, dateAdded) VALUES
 ('RME00000010', 'CHU00000001', 'ROL00000010', 'USR00000010', '2024-01-01 00:00:00');
+
+-- Donation Counter: a NON-domain-admin user with GivingApi Donations Enter + View.
+-- Used by donations tests to check that Enter Donations can work in an open batch
+-- but not in one that has been closed. Linked to PER00000080 (Donald Clark).
+INSERT INTO roles (id, churchId, name) VALUES
+('ROL00000011', 'CHU00000001', 'Donation Counter');
+
+INSERT INTO rolePermissions (id, churchId, roleId, apiName, contentType, action) VALUES
+('RPM00000011', 'CHU00000001', 'ROL00000011', 'GivingApi', 'Donations', 'Enter'),
+('RPM00000012', 'CHU00000001', 'ROL00000011', 'GivingApi', 'Donations', 'View');
+
+INSERT INTO users (id, email, password, displayName, firstName, lastName, registrationDate) VALUES
+('USR00000011', 'counter@b1.church', '$2a$10$qBWddIw2QMUlRrX9/6Cdz.nW.L5FqE45R1NTLF.V71LyhjY6I0lFu', 'Donald Clark', 'Donald', 'Clark', '2024-01-01 00:00:00');
+
+INSERT INTO userChurches (id, userId, churchId, personId) VALUES
+('UCH00000011', 'USR00000011', 'CHU00000001', 'PER00000080');
+
+INSERT INTO roleMembers (id, churchId, roleId, userId, dateAdded) VALUES
+('RME00000011', 'CHU00000001', 'ROL00000011', 'USR00000011', '2024-01-01 00:00:00');
+
+-- Two-factor test user: B1Admin's two-factor spec turns 2FA on and off for this account
+-- only, so other specs signing in with a password never hit a code prompt. Carol Clark.
+INSERT INTO users (id, email, password, displayName, firstName, lastName, registrationDate) VALUES
+('USR00000012', 'twofactor@b1.church', '$2a$10$qBWddIw2QMUlRrX9/6Cdz.nW.L5FqE45R1NTLF.V71LyhjY6I0lFu', 'Carol Clark', 'Carol', 'Clark', '2024-01-01 00:00:00');
+
+INSERT INTO userChurches (id, userId, churchId, personId) VALUES
+('UCH00000012', 'USR00000012', 'CHU00000001', 'PER00000081');
+
+INSERT INTO roleMembers (id, churchId, roleId, userId, dateAdded) VALUES
+('RME00000012', 'CHU00000001', 'ROL00000001', 'USR00000012', '2024-01-01 00:00:00');
 
 -- Add Demo User Family to Groups
 INSERT INTO groupMembers (id, churchId, groupId, personId, joinDate, leader) VALUES

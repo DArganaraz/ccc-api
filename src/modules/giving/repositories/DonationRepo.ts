@@ -3,18 +3,28 @@ import { sql } from "kysely";
 import { getDb } from "../db/index.js";
 import { UniqueIdHelper, DateHelper, ArrayHelper } from "@churchapps/apihelper";
 import { DateHelper as LocalDateHelper } from "../../../shared/helpers/DateHelper.js";
-import { Donation, DonationSummary } from "../models/index.js";
+import { Donation, DonationSummary, FundDonation } from "../models/index.js";
+import { FundDonationRepo } from "./FundDonationRepo.js";
 import { WebhookDispatcher } from "../../../shared/webhooks/index.js";
 
 @injectable()
 export class DonationRepo {
 
-  public async save(donation: Donation) {
+  public async save(donation: Donation, fundDonations?: FundDonation[]) {
     if (donation.personId === "") donation.personId = null as any;
     // Emit here rather than in the controller — online giving is logged through
     // GatewayService, so the repo is the only chokepoint that catches every path.
     const isNew = !donation.id;
     const saved = await (isNew ? this.create(donation) : this.update(donation));
+    // Fund rows are written before the emit so trigger conditions and gift merge fields see them.
+    if (fundDonations?.length) {
+      const fundDonationRepo = new FundDonationRepo();
+      for (const fd of fundDonations) {
+        fd.churchId = saved.churchId;
+        fd.donationId = saved.id;
+        await fundDonationRepo.save(fd);
+      }
+    }
     await WebhookDispatcher.emit(saved.churchId, isNew ? "donation.created" : "donation.updated", saved);
     return saved;
   }
@@ -37,6 +47,7 @@ export class DonationRepo {
       methodDetails: donation.methodDetails,
       notes: donation.notes,
       entryTime,
+      enteredBy: donation.enteredBy ?? null,
       status: donation.status,
       transactionId: donation.transactionId
     } as any).execute();
@@ -75,6 +86,18 @@ export class DonationRepo {
     const rows = await getDb().selectFrom("donations").selectAll()
       .where("churchId", "=", churchId)
       .where((eb) => eb.or([eb("status", "is", null), eb("status", "=", "complete")]))
+      .orderBy("donationDate", "desc")
+      .execute();
+    return rows;
+  }
+
+  // Dates are calendar days ("2026-01-01"), inclusive at both ends.
+  public async loadByDateRange(churchId: string, startDate: string, endDate: string) {
+    const rows = await getDb().selectFrom("donations").selectAll()
+      .where("churchId", "=", churchId)
+      .where((eb) => eb.or([eb("status", "is", null), eb("status", "=", "complete")]))
+      .where("donationDate", ">=", LocalDateHelper.toMysqlDateOnly(startDate) as any)
+      .where("donationDate", "<=", LocalDateHelper.toMysqlDateOnly(endDate) as any)
       .orderBy("donationDate", "desc")
       .execute();
     return rows;
@@ -233,6 +256,7 @@ export class DonationRepo {
       methodDetails: row.methodDetails,
       notes: row.notes,
       entryTime: row.entryTime,
+      enteredBy: row.enteredBy,
       status: row.status || "complete",
       transactionId: row.transactionId
     };

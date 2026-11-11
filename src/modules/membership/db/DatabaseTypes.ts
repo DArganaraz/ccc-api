@@ -4,7 +4,7 @@ import type {
   HouseholdPickupPerson,
   OAuthClient, OAuthCode, OAuthDeviceCode, OAuthRelaySession, OAuthToken,
   PersonField, PersonFieldValue,
-  Question, Role, RoleMember, RolePermission, Setting, Site, User, UserChurch,
+  Question, Role, RoleMember, RolePermission, Setting, Site, User, UserChurch, UserMfa,
   VisibilityPreference, Webhook, WebhookDelivery
 } from "../models/index.js";
 
@@ -36,6 +36,7 @@ interface PeopleTable {
   state?: string;
   zip?: string;
   photoUpdated?: Date;
+  dateAdded?: Date;
   householdId?: string;
   householdRole?: string;
   campusId?: string;
@@ -67,6 +68,7 @@ export interface MembershipDatabase {
   households: Household;
   jobRuns: JobRun;
   loginAttempts: LoginAttempt;
+  userMfa: UserMfa;
   householdPickupPeople: HouseholdPickupPerson;
   lists: Omit<List, "conditions" | "createdByPersonName" | "rules" | "actions" | "autoRefresh" | "notifyOnChange"> & {
     conditions: string;

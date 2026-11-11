@@ -3,10 +3,10 @@ jest.mock("../MembershipBaseController", () => ({ MembershipBaseController: clas
 jest.mock("../../helpers/index", () => ({
   Permissions: { server: { admin: "serverAdmin" }, settings: { edit: "settingsEdit" } },
   UserHelper: { replaceDomainAdminPermissions: jest.fn(async () => {}), addAllReportingPermissions: jest.fn() },
-  PersonHelper: { claim: jest.fn(async () => ({ userChurch: { churchId: "c1", personId: "p1" } })) },
+  PersonHelper: { claim: jest.fn(async (au: any) => (au?.email ? { userChurch: { churchId: "c1", personId: "p1" } } : undefined)) },
   Utils: { isEmpty: (v: any) => v === undefined || v === null || v === "" },
-  ChurchHelper: {},
-  RoleHelper: class {},
+  ChurchHelper: { selectSubDomain: jest.fn(async () => "newchurch") },
+  RoleHelper: class { async init() {} },
   Environment: {},
   HubspotHelper: {},
   MauticHelper: {},
@@ -50,7 +50,7 @@ function churchController(opts: any = {}) {
     person: { load: jest.fn(async () => ({ id: "p1", membershipStatus: "Member", name: { first: "A", last: "B" } })) },
     group: { loadAllForPerson: jest.fn(async () => []) }
   };
-  const au = "au" in opts ? opts.au : { id: "u1", churchId: opts.auChurchId ?? "c1", checkAccess: (perm: any) => (opts.access ?? []).includes(perm) };
+  const au = "au" in opts ? opts.au : { id: "u1", email: "a@b.c", churchId: opts.auChurchId ?? "c1", checkAccess: (perm: any) => (opts.access ?? []).includes(perm) };
   const controller = new ChurchController();
   (controller as any).repos = repos;
   (controller as any).actionWrapper = (_req: any, _res: any, action: any) => action(au);
@@ -123,6 +123,15 @@ describe("ChurchController.select authorization", () => {
     expect(result.status).toBe(401);
     expect(AuthenticatedUser.login).not.toHaveBeenCalled();
     expect(repos.user.load).not.toHaveBeenCalled();
+  });
+
+  // Production: 12 "reading 'userChurch'" 500s on /membership/churches/select from a principal with no email (API keys
+  // authenticate without one), because PersonHelper.claim only claims a person for an email.
+  it("returns 401 for a principal with no email instead of crashing on the claim", async () => {
+    const { controller } = churchController({ au: { id: "u1", email: "", churchId: "c1", checkAccess: () => false }, userPermission: null });
+    const result: any = await (controller as any).select({ body: { churchId: "c1" } }, {});
+    expect(result.status).toBe(401);
+    expect(AuthenticatedUser.login).not.toHaveBeenCalled();
   });
 
   it("lets a caller with no role in the target church join it", async () => {
@@ -251,5 +260,38 @@ describe("ChurchController.search name decoding", () => {
     const result: any = await controller.searchPost({ body: { name: "Grace \"Downtown\"" }, query: {} } as any, {} as any);
     expect(result.status).toBe(200);
     expect(searchedFor(repos)).toBe("Grace \"Downtown\"");
+  });
+});
+
+describe("ChurchController.addChurch currency default", () => {
+  const register = async (country: string) => {
+    const { controller, repos } = churchController();
+    repos.church.loadForUser = jest.fn(async () => []);
+    repos.church.save = jest.fn(async (c: any) => ({ ...c, id: "NEW1" }));
+    repos.setting = { save: jest.fn(async (s: any) => s) };
+    (controller as any).validateRegister = jest.fn(async () => []);
+    const result: any = await (controller as any).addChurch({ body: { name: "New Church", country } }, {});
+    return { result, repos };
+  };
+
+  it("seeds the church currency setting from the country", async () => {
+    const { result, repos } = await register("Kenya");
+    expect(result.id).toBe("NEW1");
+    expect(repos.setting.save).toHaveBeenCalledWith(expect.objectContaining({ churchId: "NEW1", keyName: "currency", value: "kes", public: "1" }));
+  });
+
+  it("does not seed a currency for an unknown country", async () => {
+    const { repos } = await register("Narnia");
+    expect(repos.setting.save).not.toHaveBeenCalled();
+  });
+
+  it("still registers the church when the seed fails", async () => {
+    const { controller, repos } = churchController();
+    repos.church.loadForUser = jest.fn(async () => []);
+    repos.church.save = jest.fn(async (c: any) => ({ ...c, id: "NEW2" }));
+    repos.setting = { save: jest.fn(async () => { throw new Error("db down"); }) };
+    (controller as any).validateRegister = jest.fn(async () => []);
+    const result: any = await (controller as any).addChurch({ body: { name: "New Church", country: "GB" } }, {});
+    expect(result.id).toBe("NEW2");
   });
 });

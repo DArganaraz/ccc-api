@@ -4,6 +4,7 @@ export class GroupAttendanceDownloadHelper {
   // One row per group member, one present/absent column per dated session.
   public static combine(report: Report) {
     const result: any[] = [];
+    const personByRow = new Map<any, any>();
     const getValue = (keyName: string) => report.queries?.find((q) => q.keyName === keyName)?.value;
     const attendance: any[] = getValue("main");
     const groups: any[] = getValue("groups");
@@ -19,7 +20,9 @@ export class GroupAttendanceDownloadHelper {
       const key = a.serviceTimeId + "//" + a.sessionDate;
       if (seen.has(key)) return;
       seen.add(key);
-      sessions.push({ name: `${a.serviceName} - ${a.serviceTimeName} (${a.sessionDate})`, serviceTimeId: a.serviceTimeId, sessionDate: a.sessionDate });
+      // Sessions of groups with no service time are labeled by date alone.
+      const service = [a.serviceName, a.serviceTimeName].filter(Boolean).join(" - ");
+      sessions.push({ name: service ? `${service} (${a.sessionDate})` : a.sessionDate, serviceTimeId: a.serviceTimeId, sessionDate: a.sessionDate });
     });
 
     const present = new Set<string>(attendance.map((a) => [a.groupId, a.personId, a.serviceTimeId, a.sessionDate].join("//")));
@@ -35,10 +38,11 @@ export class GroupAttendanceDownloadHelper {
         row.personId = person.id;
         row.groupId = g.id;
         result.push(row);
+        personByRow.set(row, person);
       });
     });
 
-    result.sort((a, b) => (a.groupName || "").localeCompare(b.groupName || "") || (a.displayName || "").localeCompare(b.displayName || ""));
+    result.sort((a, b) => (a.groupName || "").localeCompare(b.groupName || "") || (personByRow.get(a).lastName || "").localeCompare(personByRow.get(b).lastName || "") || (personByRow.get(a).firstName || "").localeCompare(personByRow.get(b).firstName || ""));
     return result;
   }
 }

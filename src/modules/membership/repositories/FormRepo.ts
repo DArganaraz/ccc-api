@@ -25,6 +25,7 @@ export class FormRepo {
       accessEndTime: accessEndTime as any,
       restricted: form.restricted,
       thankYouMessage: form.thankYouMessage,
+      photoUrl: form.photoUrl || null,
       displayMode: form.displayMode ?? "standard",
       autoCreatePerson: form.autoCreatePerson ?? false,
       groupId: form.groupId || null,
@@ -50,6 +51,7 @@ export class FormRepo {
       accessEndTime: accessEndTime as any,
       archived: form.archived,
       thankYouMessage: form.thankYouMessage,
+      photoUrl: form.photoUrl || null,
       displayMode: form.displayMode ?? "standard",
       autoCreatePerson: form.autoCreatePerson ?? false,
       groupId: form.groupId || null,
@@ -84,6 +86,16 @@ export class FormRepo {
       .where("churchId", "=", churchId)
       .where("removed", "=", false as any)
       .where("id", "in", ids)
+      .orderBy("name")
+      .execute();
+  }
+
+  public async loadForGroup(churchId: string, groupId: string) {
+    return getDb().selectFrom("forms").selectAll()
+      .where("churchId", "=", churchId)
+      .where("groupId", "=", groupId)
+      .where("removed", "=", false as any)
+      .where("archived", "=", false as any)
       .orderBy("name")
       .execute();
   }
@@ -178,6 +190,7 @@ export class FormRepo {
       archived: row.archived,
       action: row.action,
       thankYouMessage: row.thankYouMessage,
+      photoUrl: row.photoUrl,
       displayMode: row.displayMode,
       autoCreatePerson: row.autoCreatePerson,
       groupId: row.groupId,

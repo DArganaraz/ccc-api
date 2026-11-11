@@ -6,6 +6,7 @@ interface PermPair { contentType: string; action: string; }
 const peopleRead: PermPair[] = [
   { contentType: "People", action: "View" },
   { contentType: "People", action: "View Members" },
+  { contentType: "People", action: "View Names" },
   { contentType: "Group Members", action: "View" }
 ];
 
@@ -28,6 +29,8 @@ const messagingRead: PermPair[] = [{ contentType: "Messaging", action: "View" }]
 const rolesRead: PermPair[] = [{ contentType: "Roles", action: "View" }];
 
 const settingsRead: PermPair[] = [{ contentType: "Settings", action: "View" }];
+
+const workflowsRead: PermPair[] = [{ contentType: "Tasks", action: "View" }];
 
 // `write` scopes include matching `read` pairs — connectors need both.
 const SCOPE_CATALOG: Record<string, PermPair[]> = {
@@ -98,7 +101,15 @@ const SCOPE_CATALOG: Record<string, PermPair[]> = {
   "roles:write": [...rolesRead, { contentType: "Roles", action: "Edit" }],
 
   "settings:read": settingsRead,
-  "settings:write": [...settingsRead, { contentType: "Settings", action: "Edit" }]
+  "settings:write": [...settingsRead, { contentType: "Settings", action: "Edit" }],
+
+  "workflows:read": workflowsRead,
+  // Running a workflow can send email/SMS, fire webhooks and change group membership.
+  "workflows:write": [
+    ...workflowsRead,
+    { contentType: "Tasks", action: "Edit" },
+    { contentType: "Tasks", action: "Admin" }
+  ]
 };
 
 // Server/Domain admin permissions intentionally absent — credentials cannot escalate to site admin.

@@ -7,6 +7,9 @@ export interface ContentModuleGateway {
   loadRegistrationMembersByPerson(churchId: string, personId: string): Promise<any[]>;
   loadEventRsvpsByPerson(churchId: string, personId: string): Promise<any[]>;
   loadEventBookingsByPerson(churchId: string, personId: string): Promise<any[]>;
+  loadEvent(churchId: string, eventId: string): Promise<any | null>;
+  // Events of a group that collect registration answers through a form.
+  loadEventsForGroup(churchId: string, groupId: string): Promise<{ id: string; title: string; start: Date; groupId: string; formId: string }[]>;
   // Expand a recurring event's occurrences in the window to civil-local dates.
   // Lives here (not in messaging) so the recurrence engine stays inside content.
   expandEventOccurrences(event: any, from: Date, to: Date): Promise<CivilOccurrence[]>;
@@ -47,6 +50,24 @@ class ContentModuleGatewayDb implements ContentModuleGateway {
     return (await this.db()).selectFrom("eventBookings").selectAll()
       .where("churchId", "=", churchId)
       .where("requestedBy", "=", personId)
+      .execute();
+  }
+
+  public async loadEvent(churchId: string, eventId: string) {
+    const row = await (await this.db()).selectFrom("events").selectAll()
+      .where("churchId", "=", churchId)
+      .where("id", "=", eventId)
+      .executeTakeFirst();
+    return row ?? null;
+  }
+
+  public async loadEventsForGroup(churchId: string, groupId: string) {
+    return (await this.db()).selectFrom("events").select(["id", "title", "start", "groupId", "formId"])
+      .where("churchId", "=", churchId)
+      .where("groupId", "=", groupId)
+      .where("formId", "is not", null)
+      .where("formId", "<>", "")
+      .orderBy("start", "desc")
       .execute();
   }
 

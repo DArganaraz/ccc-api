@@ -22,6 +22,13 @@ export interface TimelineSegment {
 export class ScreenScheduleHelper {
   static readonly WINDOW_DAYS = 7;
 
+  // "Play once, then hold the last slide" is retired. A saved holdLast row plays as teacher paced.
+  static playbackEndBehavior(endBehavior?: string | null): "loop" | "fallback" | "teacherPaced" {
+    if (endBehavior === "holdLast" || endBehavior === "teacherPaced") return "teacherPaced";
+    if (endBehavior === "fallback") return "fallback";
+    return "loop";
+  }
+
   static validTimeZone(timeZone?: string): string {
     if (!timeZone) return "America/New_York";
     try {
@@ -103,6 +110,8 @@ export class ScreenScheduleHelper {
   }
 
   static mediaTypeFromUrl(url: string): "video" | "image" | "audio" {
+    // Extensionless video links: lessons.church external videos and Mux streams (same rule as FreePlay's manual player).
+    if (/\/externalVideos\//i.test(url || "") || /^https?:\/\/stream\.mux\.com\//i.test(url || "")) return "video";
     const ext = (url || "").split("?")[0].split(".").pop()?.toLowerCase() || "";
     if (["mp4", "m4v", "mov", "webm", "mkv", "m3u8"].includes(ext)) return "video";
     if (["mp3", "m4a", "wav", "aac", "ogg"].includes(ext)) return "audio";

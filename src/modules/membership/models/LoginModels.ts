@@ -7,6 +7,8 @@ export interface LoginRequest {
   appName?: string;
   authGuid?: string;
   jwt?: string;
+  mfaToken?: string;
+  mfaCode?: string;
 }
 
 export interface LoginResponse {
@@ -41,6 +43,8 @@ export interface LoginUserChurch {
   groups?: Array<{ id: string; [key: string]: any }>;
   apis?: any[];
   jwt?: string;
+  mfaToken?: string;
+  mfaCode?: string;
 }
 
 export interface EmailPassword {
@@ -85,7 +89,6 @@ export interface RegisterUserRequest {
   churchId?: string;
   appName?: string;
   appUrl?: string;
-  website?: string;
   fillMs?: number;
 }
 

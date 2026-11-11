@@ -7,8 +7,9 @@ jest.mock("../../helpers/index", () => ({
   UserChurchHelper: { createForGroupMember: jest.fn() }
 }));
 jest.mock("../../../../shared/webhooks/index", () => ({ WebhookDispatcher: { emit: jest.fn() } }));
-jest.mock("../../../../shared/helpers/TransactionalEmailHelper.js", () => ({ TransactionalEmailHelper: { sendTransactional: jest.fn() } }));
+jest.mock("../../../../shared/helpers/TransactionalEmailHelper.js", () => ({ TransactionalEmailHelper: { sendTransactional: jest.fn(), fromAddress: (name?: string) => (name ? `"${name}" <support@churchapps.org>` : "support@churchapps.org") } }));
 jest.mock("axios", () => ({ post: jest.fn() }));
+jest.mock("../../../../shared/modules/index.js", () => ({ getContentModuleGateway: () => ({ loadEvent: jest.fn(async () => null), loadEventsForGroup: jest.fn(async () => []) }) }));
 jest.mock("../../../../shared/helpers/NotificationService", () => ({ NotificationService: { createNotifications: jest.fn() } }));
 
 import { FormSubmissionController } from "../FormSubmissionController.js";
@@ -70,6 +71,23 @@ describe("FormSubmissionController.save churchId", () => {
     expect(result[0].churchId).toBe("c1");
   });
 
+  it("lets a signed-in person of the form's church submit a restricted form", async () => {
+    const { controller, repos } = formSubmissionController({ auChurchId: "c1", auId: "u1", form: { id: "f1", churchId: "c1", name: "Members Only", restricted: true } });
+    const result: any = await (controller as any).save({ body: [{ formId: "f1" }] }, {});
+    expect(repos.formSubmission.save).toHaveBeenCalledTimes(1);
+    expect(result[0].error).toBeUndefined();
+  });
+
+  it("refuses a restricted form to anonymous and other-church callers", async () => {
+    const restricted = { id: "f1", churchId: "c1", name: "Members Only", restricted: true };
+    for (const au of [{ checkAccess: () => false }, { churchId: "otherChurch", id: "u2", checkAccess: () => false }]) {
+      const { controller, repos } = formSubmissionController({ au, form: restricted });
+      const result: any = await (controller as any).save({ body: [{ formId: "f1" }] }, {});
+      expect(repos.formSubmission.save).not.toHaveBeenCalled();
+      expect(result[0].error).toBe("You're not allowed to submit Members Only");
+    }
+  });
+
   it("lets an authenticated other-church caller submit an unrestricted form under the form church", async () => {
     const { controller, repos } = formSubmissionController({ auChurchId: "otherChurch", auId: "u1" });
     const result: any = await (controller as any).save({ body: [{ formId: "f1", churchId: "otherChurch" }] }, {});
@@ -115,6 +133,13 @@ describe("FormSubmissionController.save group auto-add", () => {
     (ConversationalFormHelper.findOrCreatePerson as jest.Mock).mockResolvedValueOnce({ id: "p1", name: { first: "Al" } });
     const { controller, repos } = formSubmissionController({ form: { id: "f1", churchId: "c1", name: "Camp", restricted: false, autoCreatePerson: true, groupId: "g1" }, groupMembers: [{ personId: "p1" }] });
     await (controller as any).save({ body: [{ formId: "f1", contentType: "form", contentId: "f1", answers: [] }] }, {});
+    expect(repos.groupMember.save).not.toHaveBeenCalled();
+  });
+
+  it("only links (no auto-add) when the form does not create person records", async () => {
+    const { controller, repos } = formSubmissionController({ auChurchId: "c1", auId: "u1", au: { churchId: "c1", id: "u1", personId: "p1", checkAccess: () => false }, form: { id: "f1", churchId: "c1", name: "Outreach", restricted: false, autoCreatePerson: false, groupId: "g1" } });
+    await (controller as any).save({ body: [{ formId: "f1", contentType: "person", contentId: "p1", answers: [] }] }, {});
+    expect(repos.formSubmission.save).toHaveBeenCalledTimes(1);
     expect(repos.groupMember.save).not.toHaveBeenCalled();
   });
 
@@ -255,5 +280,59 @@ describe("FormSubmissionController.sendEmails notifications", () => {
     expect(TransactionalEmailHelper.sendTransactional).toHaveBeenCalledTimes(1);
     expect((TransactionalEmailHelper.sendTransactional as jest.Mock).mock.calls[0][1]).toBe("michael@test.org");
     expect(NotificationService.createNotifications).toHaveBeenCalledWith(["p1"], "c1", "form", "f1", "New Form Submission: Contact Form");
+  });
+});
+
+describe("FormSubmissionController.getMy", () => {
+  const rows = [
+    { id: "s2", churchId: "c1", formId: "f2", submittedBy: "me", formName: "Camp", submissionDate: "2026-10-01" },
+    { id: "s1", churchId: "c1", formId: "f1", submittedBy: "me", formName: "Connect", submissionDate: "2026-09-01" }
+  ];
+  function myController(au: any) {
+    const { controller, repos } = formSubmissionController({ au });
+    repos.formSubmission.loadForSubmitter = jest.fn(async () => rows);
+    repos.formSubmission.convertAllToModel = (_c: string, data: any[]) => data.map((d) => ({ ...d }));
+    repos.question.loadForForm = jest.fn(async (_c: string, formId: string) => [{ id: "q-" + formId, formId }]);
+    repos.answer.loadForFormSubmissions = jest.fn(async () => [{ id: "a1", formSubmissionId: "s1", questionId: "q-f1", value: "Yes" }, { id: "a2", formSubmissionId: "s2", questionId: "q-f2", value: "Blue" }]);
+    repos.answer.convertAllToModel = (_c: string, data: any[]) => data;
+    (controller as any).include = (req: any, item: string) => (req.query?.include || "").split(",").includes(item);
+    return { controller, repos };
+  }
+
+  it("returns only the caller's own submissions without forms permission", async () => {
+    const { controller, repos } = myController({ churchId: "c1", id: "u1", personId: "me", checkAccess: () => false });
+    const result: any = await (controller as any).getMy({ query: {} }, {});
+    expect(repos.formSubmission.loadForSubmitter).toHaveBeenCalledWith("c1", "me");
+    expect(result.map((s: any) => s.id)).toEqual(["s2", "s1"]);
+    expect(result[0].answers).toBeUndefined();
+  });
+
+  it("attaches each submission's questions and answers when asked", async () => {
+    const { controller } = myController({ churchId: "c1", id: "u1", personId: "me", checkAccess: () => false });
+    const result: any = await (controller as any).getMy({ query: { include: "questions,answers" } }, {});
+    expect(result[1].questions).toEqual([{ id: "q-f1", formId: "f1" }]);
+    expect(result[1].answers).toEqual([expect.objectContaining({ id: "a1", value: "Yes" })]);
+    expect(result[0].answers).toEqual([expect.objectContaining({ id: "a2", value: "Blue" })]);
+  });
+
+  it("rejects a caller who isn't linked to a person", async () => {
+    const { controller, repos } = myController({ churchId: "c1", id: "u1", checkAccess: () => false });
+    const result: any = await (controller as any).getMy({ query: {} }, {});
+    expect(result.status).toBe(401);
+    expect(repos.formSubmission.loadForSubmitter).not.toHaveBeenCalled();
+  });
+});
+
+describe("FormSubmissionController.save submittedBy", () => {
+  it("records the signed-in member as the submitter, whatever the body says", async () => {
+    const { controller, repos } = formSubmissionController({ au: { churchId: "c1", id: "u1", personId: "me", checkAccess: () => false } });
+    await (controller as any).save({ body: [{ formId: "f1", submittedBy: "someoneElse", answers: [] }] }, {});
+    expect(repos.formSubmission.save.mock.calls[0][0].submittedBy).toBe("me");
+  });
+
+  it("leaves an anonymous submission without a submitter", async () => {
+    const { controller, repos } = formSubmissionController({ au: { checkAccess: () => false } });
+    await (controller as any).save({ body: [{ formId: "f1", submittedBy: "someoneElse", answers: [] }] }, {});
+    expect(repos.formSubmission.save.mock.calls[0][0].submittedBy).toBeNull();
   });
 });

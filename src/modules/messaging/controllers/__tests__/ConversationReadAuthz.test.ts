@@ -1,12 +1,14 @@
 import "reflect-metadata";
 
 // Same scaffolding as PublicChatAccess.test.ts - the real canReadConversation runs.
-jest.mock("../../../../shared/infrastructure/index", () => ({ BaseController: class { constructor(_module?: string) {} } }));
+jest.mock("../../../../shared/infrastructure/index", () => ({ BaseController: class { constructor(_module?: string) {} async writeAuditLog() {} } }));
 jest.mock("../../repositories/index", () => ({ Repos: class {} }));
 jest.mock("@churchapps/apihelper", () => ({ ArrayHelper: { getOne: jest.fn() }, EncryptionHelper: { decrypt: jest.fn((s: string) => "decrypted:" + s) } }));
 jest.mock("../../helpers/DeliveryHelper", () => ({ DeliveryHelper: { sendConversationMessages: jest.fn(), sendAttendance: jest.fn(), sendBlockedIps: jest.fn() } }));
 jest.mock("../../helpers/NotificationHelper", () => ({ NotificationHelper: { checkShouldNotify: jest.fn() } }));
-jest.mock("../../../../shared/helpers/Permissions", () => ({ Permissions: { content: { edit: "contentEdit" }, tasks: { view: "tasksView" }, chat: { host: "chatHost" }, people: { edit: "peopleEdit", viewConfidentialNotes: "peopleViewConfidentialNotes" } } }));
+jest.mock("../../../../shared/helpers/Permissions", () => ({ Permissions: { content: { edit: "contentEdit" }, tasks: { view: "tasksView" }, chat: { host: "chatHost" }, people: { edit: "peopleEdit", viewConfidentialNotes: "peopleViewConfidentialNotes" }, groups: { edit: "groupsEdit" }, groupMembers: { view: "groupMembersView" }, calendars: { admin: "calendarsAdmin" } } }));
+const mockLoadEvent = jest.fn(async () => null as any);
+jest.mock("../../../../shared/modules/ContentModuleGateway.js", () => ({ getContentModuleGateway: () => ({ loadEvent: (...args: any[]) => mockLoadEvent(...(args as [])) }) }));
 jest.mock("../../../../shared/modules/MembershipModuleGateway.js", () => ({ getMembershipModuleGateway: () => ({ loadChurch: jest.fn(async () => ({ id: "c1" })) }) }));
 
 // workflowCard notes check the card through the doing gateway (lazy import in the controller).
@@ -45,7 +47,7 @@ function repos(opts: any = {}) {
       loadByIds: jest.fn(async () => opts.byIds ?? []),
       loadForContent: jest.fn(async () => opts.forContent ?? []),
       loadCurrent: jest.fn(async () => opts.current ?? null),
-      loadPosts: jest.fn(async () => []),
+      loadPosts: jest.fn(async () => opts.posts ?? []),
       save: jest.fn(async (c: any) => ({ ...c, id: c.id || "new1" })),
       updateStats: jest.fn(async () => undefined),
       convertToModel: (c: any) => c,
@@ -55,6 +57,8 @@ function repos(opts: any = {}) {
       loadForConversation: jest.fn(async () => opts.messages ?? [{ id: "m1" }]),
       loadForConversationsPaginated: jest.fn(async (_churchId: string, ids: string[]) => new Map(ids.map((id) => [id, opts.messages ?? [{ id: "m1" }]]))),
       loadByIds: jest.fn(async () => []),
+      loadById: jest.fn(async () => null),
+      save: jest.fn(async (m: any) => ({ ...m, id: m.id || "msg1" })),
       convertToModel: (m: any) => m,
       convertAllToModel: (rows: any[]) => rows
     },
@@ -67,7 +71,7 @@ function repos(opts: any = {}) {
       convertToModel: (c: any) => c,
       convertAllToModel: (rows: any[]) => rows
     },
-    privateMessage: { loadById: jest.fn(async () => opts.privateMessage ?? null) }
+    privateMessage: { loadById: jest.fn(async () => opts.privateMessage ?? null), loadByConversationId: jest.fn(async () => opts.privateMessageByConversation ?? null) }
   };
 }
 
@@ -109,6 +113,42 @@ describe("ConversationController.forContent group membership", () => {
     expect((await (attach(new ConversationController(), nonHost, MEMBER) as any).forContent("streamingLiveHost", "svc1", { query: {} }, {})).status).toBe(401);
     const host = repos({ forContent: [hostConv] });
     expect(await (attach(new ConversationController(), host, HOST) as any).forContent("streamingLiveHost", "svc1", { query: {} }, {})).toEqual([hostConv]);
+  });
+});
+
+describe("group and event notes", () => {
+  const noteConv = { id: "gn1", churchId: "c1", contentType: "groupNote", contentId: "g1", allowAnonymousPosts: false, visibility: "hidden" };
+  const eventConv = { id: "en1", churchId: "c1", contentType: "eventNote", contentId: "e1", allowAnonymousPosts: false, visibility: "hidden" };
+  const forContent = (principal: any, conv: any) =>
+    (attach(new ConversationController(), repos({ forContent: [conv] }), principal) as any).forContent(conv.contentType, conv.contentId, { query: {} }, {});
+  const post = (principal: any, conv: any) =>
+    (attach(new MessageController(), repos({ byId: conv }), principal) as any).save({ body: [{ conversationId: conv.id, content: "hi" }] }, {});
+
+  it("hides group notes from members and every staff permission", async () => {
+    for (const principal of [MEMBER, STAFF, au({ access: ["groupsEdit", "groupMembersView"] }), au({ leaderGroupIds: ["other"] })]) {
+      expect((await forContent(principal, noteConv)).status).toBe(401);
+      expect((await post(principal, noteConv)).status).toBe(401);
+    }
+  });
+
+  it("lets the group's leaders read and post group notes", async () => {
+    expect(await forContent(LEADER, noteConv)).toEqual([noteConv]);
+    expect((await post(LEADER, noteConv)).status).not.toBe(401);
+  });
+
+  it("gates event notes by the event's view and post roles", async () => {
+    mockLoadEvent.mockResolvedValue({ id: "e1", groupId: "g1", notesViewRole: "members", notesPostRole: "leaders" });
+    expect(await forContent(MEMBER, eventConv)).toEqual([eventConv]);
+    expect((await forContent(NON_MEMBER, eventConv)).status).toBe(401);
+    expect((await post(MEMBER, eventConv)).status).toBe(401);
+    expect((await post(LEADER, eventConv)).status).not.toBe(401);
+    expect(await forContent(STAFF, eventConv)).toEqual([eventConv]);
+  });
+
+  it("defaults event notes to staff only", async () => {
+    mockLoadEvent.mockResolvedValue({ id: "e1", groupId: "g1" });
+    expect((await forContent(LEADER, eventConv)).status).toBe(401);
+    expect(await forContent(au({ access: ["calendarsAdmin"] }), eventConv)).toEqual([eventConv]);
   });
 });
 
@@ -172,6 +212,12 @@ describe("MessageController read paths", () => {
     expect(await loadByConversation(NON_MEMBER, { byId: dmConv, privateMessage: { fromPersonId: "p1", toPersonId: "pY" } }).result).toEqual([{ id: "m1" }]);
   });
 
+  it("lets a participant read a DM whose contentId is a person id", async () => {
+    const personKeyed = { ...dmConv, contentId: "pY" };
+    expect(await loadByConversation(NON_MEMBER, { byId: personKeyed, privateMessageByConversation: { fromPersonId: "pY", toPersonId: "p1" } }).result).toEqual([{ id: "m1" }]);
+    expect((await loadByConversation(NON_MEMBER, { byId: personKeyed, privateMessageByConversation: { fromPersonId: "pY", toPersonId: "pZ" } }).result).status).toBe(401);
+  });
+
   it("401s catchup on the host room for a non-host and allows a host", async () => {
     const denied = repos({ byId: hostConv });
     expect((await (attach(new MessageController(), denied, MEMBER) as any).catchup("c1", "host1", {}, {})).status).toBe(401);
@@ -215,6 +261,30 @@ describe("cross-church and ownership gates", () => {
     const r = repos();
     expect((await (attach(new ConversationController(), r, NON_MEMBER) as any).getPostsForGroup("g1", {}, {})).status).toBe(401);
     expect(r.conversation.loadPosts).not.toHaveBeenCalled();
+  });
+
+  describe("posts feeds hide leader-only notes", () => {
+    const postRows = () => [
+      { id: "grp1", contentType: "group", contentId: "g1", groupId: "g1" },
+      { id: "gn1", contentType: "groupNote", contentId: "g1", groupId: "g1" }
+    ];
+    const ids = (rows: any[]) => rows.map((c) => c.id);
+
+    it("drops group notes from /posts for a member who is not a leader", async () => {
+      const r = repos({ posts: postRows() });
+      expect(ids(await (attach(new ConversationController(), r, MEMBER) as any).getPosts({}, {}))).toEqual(["grp1"]);
+    });
+
+    it("drops group notes from /posts/group for content.edit staff", async () => {
+      const r = repos({ posts: postRows() });
+      expect(ids(await (attach(new ConversationController(), r, STAFF) as any).getPostsForGroup("g1", {}, {}))).toEqual(["grp1"]);
+    });
+
+    it("keeps group notes for the group's leader", async () => {
+      const r = repos({ posts: postRows() });
+      const leader = au({ groupIds: ["g1"], leaderGroupIds: ["g1"] });
+      expect(ids(await (attach(new ConversationController(), r, leader) as any).getPosts({}, {}))).toEqual(["grp1", "gn1"]);
+    });
   });
 
   it("401s a member rewriting an existing DM conversation", async () => {

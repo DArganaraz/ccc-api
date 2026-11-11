@@ -13,9 +13,11 @@ export class Plan {
   public providerId?: string;
   public providerPlanId?: string;
   public providerPlanName?: string;
-  public signupDeadlineHours?: number;
+  public signupDeadlineHours?: number | null;
   public showVolunteerNames?: boolean;
   public prepared?: boolean;
   public autoReplaceOnDecline?: boolean;
   public lastAutofillRunId?: string;
+  public confirmationWorkflowId?: string | null;
+  public lessonTrimWarning?: string | null;
 }

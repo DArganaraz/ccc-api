@@ -8,21 +8,23 @@ import { RepoManager } from "../shared/infrastructure/RepoManager.js";
 import { AutomationHelper } from "../modules/bridge/helpers/AutomationHelper.js";
 
 const initEnv = async () => {
-  console.log("[initEnv] Starting environment initialization...");
+  console.debug("[initEnv] Starting environment initialization...");
   if (!Environment.currentEnvironment) {
-    console.log("[initEnv] Environment not initialized, calling Environment.init...");
+    console.debug("[initEnv] Environment not initialized, calling Environment.init...");
     await Environment.init(process.env.ENVIRONMENT || "dev");
-    console.log("[initEnv] Environment initialized");
+    console.debug("[initEnv] Environment initialized");
   } else {
-    console.log("[initEnv] Environment already initialized (warm start)");
+    console.debug("[initEnv] Environment already initialized (warm start)");
   }
 
   // Always initialize messaging helpers (repos may be undefined on warm starts)
-  console.log("[initEnv] Initializing messaging repos...");
+  console.debug("[initEnv] Initializing messaging repos...");
   const repos = await RepoManager.getRepos<any>("messaging");
-  NotificationHelper.init(repos);
-  console.log("[initEnv] NotificationHelper initialized with repos");
-  console.log("[initEnv] Environment initialization complete");
+  // Recovered serving-request cards can create app alerts and human assignments.
+  const { initializeNotificationDelivery } = await import("../modules/messaging/index.js");
+  initializeNotificationDelivery(repos);
+  console.debug("[initEnv] NotificationHelper initialized with repos");
+  console.debug("[initEnv] Environment initialization complete");
 };
 
 export const handle30MinTimer = async (_event: ScheduledEvent, _context: Context): Promise<void> => {
@@ -43,6 +45,13 @@ export const handle30MinTimer = async (_event: ScheduledEvent, _context: Context
     const { ExecutionHelper } = await import("../modules/doing/helpers/ExecutionHelper.js");
     const doingRepos = await RepoManager.getRepos<any>("doing");
     return ExecutionHelper.processDue(doingRepos);
+  });
+
+  // Resume workflow cards whose wait has ended, so a "1 day" wait means about a day.
+  await JobRunHelper.run("workflowSnoozed", async () => {
+    const { WorkflowHelper } = await import("../modules/doing/helpers/WorkflowHelper.js");
+    const doingRepos = await RepoManager.getRepos<any>("doing");
+    return WorkflowHelper.processSnoozed(doingRepos);
   });
 
   await JobRunHelper.run("scanReminders", async () => {
@@ -82,7 +91,8 @@ export const handleMidnightTimer = async (_event: ScheduledEvent, _context: Cont
 
   await JobRunHelper.run("advanceRecurringServices", async () => {
     const contentRepos = await RepoManager.getRepos<any>("content");
-    return contentRepos.streamingService.advanceRecurringServices();
+    const { RecurringStreamHelper } = await import("../modules/content/helpers/RecurringStreamHelper.js");
+    return RecurringStreamHelper.advanceStale(contentRepos.streamingService);
   });
 
   // Re-evaluate auto-refresh Lists (saved filters) and run their attached actions.
@@ -155,6 +165,12 @@ export const handleWebhookTimer = async (_event: ScheduledEvent, _context: Conte
     const repos = await RepoManager.getRepos<any>("membership");
     return WebhookDeliveryWorker.process(repos);
   });
+  // Scheduled push notifications go out on this one-minute clock (ChurchAppsSupport#1411).
+  await JobRunHelper.run("scheduledNotifications", async () => {
+    const { ScheduledNotificationHelper } = await import("../modules/messaging/helpers/ScheduledNotificationHelper.js");
+    const messagingRepos = await RepoManager.getRepos<any>("messaging");
+    return ScheduledNotificationHelper.dispatchDue(messagingRepos);
+  });
 };
 
 export const handleScheduledTasks = async (_event: ScheduledEvent, _context: Context): Promise<void> => {
@@ -163,14 +179,10 @@ export const handleScheduledTasks = async (_event: ScheduledEvent, _context: Con
 
   const doingRepos = await RepoManager.getRepos<any>("doing");
 
-  // Workflow card maintenance: overdue reminders + un-snooze sweep.
+  // Workflow card overdue reminders (the un-snooze sweep runs on the 30-minute timer).
   await JobRunHelper.run("workflowOverdue", async () => {
     const { WorkflowHelper } = await import("../modules/doing/helpers/WorkflowHelper.js");
     return WorkflowHelper.processOverdue(doingRepos);
-  });
-  await JobRunHelper.run("workflowSnoozed", async () => {
-    const { WorkflowHelper } = await import("../modules/doing/helpers/WorkflowHelper.js");
-    return WorkflowHelper.processSnoozed(doingRepos);
   });
 
   // Recurring scheduled rules (pull path of the unified RuleEngine).

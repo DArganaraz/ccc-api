@@ -1,9 +1,12 @@
 import express from "express";
 import { controller, httpDelete, httpGet, httpPost, requestParam } from "inversify-express-utils";
 import { UniqueIdHelper } from "@churchapps/apihelper";
+import { AssignmentWorkflowHelper } from "../helpers/AssignmentWorkflowHelper.js";
 import { PlanHelper } from "../helpers/PlanHelper.js";
 import { MatrixEmailHelper } from "../helpers/MatrixEmailHelper.js";
 import { MatrixTextHelper } from "../helpers/MatrixTextHelper.js";
+import { SignupDeadlineHelper } from "../helpers/SignupDeadlineHelper.js";
+import { LessonTrimHelper } from "../helpers/LessonTrimHelper.js";
 import { Assignment, Plan, PlanItem, PlanItemTime, Position, Time } from "../models/index.js";
 import { DoingBaseController } from "./DoingBaseController.js";
 import { PlanAuth, Permissions } from "../../../shared/helpers/index.js";
@@ -50,6 +53,16 @@ export class PlanController extends DoingBaseController {
       if (!au.checkAccess(Permissions.texting.send) || !await PlanAuth.canEditMinistry(au, ministryId)) return this.json({}, 401);
       const rows = (await this.repos.assignment.loadOverviewByDateRange(au.churchId, startDate, endDate, ministryId, planTypeId)) as any[];
       return await MatrixTextHelper.preview(au.churchId, rows);
+    });
+  }
+
+  @httpGet("/confirmationWorkflows")
+  public async confirmationWorkflows(req: express.Request, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      const ministryId = typeof req.query.ministryId === "string" ? req.query.ministryId : undefined;
+      if (!await PlanAuth.canEditMinistry(au, ministryId)) return this.json({}, 401);
+      return (await this.repos.workflow.loadAll(au.churchId)).filter((w) => w.active && w.workflowType === AssignmentWorkflowHelper.workflowType)
+        .map((w) => ({ id: w.id, name: w.name }));
     });
   }
 
@@ -102,6 +115,8 @@ export class PlanController extends DoingBaseController {
       const allPositions: Position[] = (await this.repos.position.loadByPlanIds(churchId, planIds)) as Position[];
       const allAssignments: Assignment[] = (await this.repos.assignment.loadByPlanIds(churchId, planIds)) as Assignment[];
       const allTimes: Time[] = (await this.repos.time.loadByPlanIds(churchId, planIds)) as Time[];
+      const needsZone = plans.some(p => p.signupDeadlineHours && !allTimes.some(t => t.planId === p.id && t.startTime));
+      const timeZone = needsZone ? await SignupDeadlineHelper.churchTimeZone(churchId) : undefined;
 
       return plans.map(plan => {
         const positions = allPositions
@@ -111,7 +126,8 @@ export class PlanController extends DoingBaseController {
             return { ...p, filledCount };
           });
         const times = allTimes.filter(t => t.planId === plan.id);
-        return { plan, positions, times };
+        const deadline = plan.signupDeadlineHours ? SignupDeadlineHelper.compute(plan, times, timeZone) : null;
+        return { plan: { ...plan, signupDeadline: deadline ? deadline.toISOString() : null }, positions, times };
       });
     });
   }
@@ -129,7 +145,7 @@ export class PlanController extends DoingBaseController {
       const people = personIds.length > 0 ? await getMembershipModuleGateway().loadPeople(au.churchId, personIds) : [];
       return positions.map(p => ({
         positionId: p.id,
-        names: assignments.filter(a => a.positionId === p.id).map(a => people.find(person => person.id === a.personId)?.displayName).filter(Boolean)
+        names: people.filter(person => assignments.some(a => a.positionId === p.id && a.personId === person.id)).map(person => person.displayName)
       }));
     });
   }
@@ -309,6 +325,14 @@ export class PlanController extends DoingBaseController {
     });
   }
 
+  @httpPost("/:id/issueRequests")
+  public async issueRequests(@requestParam("id") id: string, req: express.Request, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!await PlanAuth.canEditPlan(au, id)) return this.json({}, 401);
+      return AssignmentWorkflowHelper.issuePlan(au.churchId, id, this.repos);
+    });
+  }
+
   @httpPost("/copy/:id")
   public async copy(@requestParam("id") id: string, req: express.Request<{}, {}, Plan & { copyMode?: string; copyServiceOrder?: boolean; targetPlanId?: string }>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
@@ -332,12 +356,15 @@ export class PlanController extends DoingBaseController {
         delete (p as any).copyMode;
         delete (p as any).copyServiceOrder;
         delete (p as any).targetPlanId;
+        delete p.lessonTrimWarning;
         p.churchId = au.churchId;
         p.serviceDate = new Date(req.body.serviceDate || new Date());
         p.notes ??= oldPlan.notes;
-        p.signupDeadlineHours ??= oldPlan.signupDeadlineHours;
+        if (!("signupDeadlineHours" in req.body)) p.signupDeadlineHours = oldPlan.signupDeadlineHours;
         p.showVolunteerNames ??= oldPlan.showVolunteerNames;
         p.autoReplaceOnDecline ??= oldPlan.autoReplaceOnDecline;
+        if (p.confirmationWorkflowId === undefined) p.confirmationWorkflowId = oldPlan.confirmationWorkflowId;
+        if (p.confirmationWorkflowId) await AssignmentWorkflowHelper.validateWorkflow(au.churchId, p.confirmationWorkflowId, this.repos);
         plan = await this.repos.plan.save(p);
       }
 
@@ -351,6 +378,12 @@ export class PlanController extends DoingBaseController {
 
       if (copyServiceOrder) {
         planItemIdMap = await this.copyServiceOrderItems(au.churchId, id, plan.id!, positionIdMap);
+      }
+
+      // A lesson scheduled by copying the previous plan gets the plan type's saved lesson trim.
+      if (!targetPlanId && !copyServiceOrder) {
+        const trimmed = await LessonTrimHelper.apply(this.repos, au.churchId, plan);
+        if (trimmed) plan.lessonTrimWarning = trimmed.warning;
       }
 
       if (timeIdMap.size > 0 && planItemIdMap.size > 0) {
@@ -372,9 +405,12 @@ export class PlanController extends DoingBaseController {
       // Handle both single plan object and array of plans
       const plans = Array.isArray(req.body) ? req.body : [req.body];
 
+      const previousPaths = new Map<Plan, string | null>();
       for (const plan of plans) {
         const existing: any = plan.id ? await this.repos.plan.load(au.churchId, plan.id) : null;
+        previousPaths.set(plan, existing ? existing.providerPlanId || null : undefined);
         if (existing && !await PlanAuth.canEditMinistry(au, existing.ministryId)) return this.json({}, 401);
+        if (plan.confirmationWorkflowId && plan.confirmationWorkflowId !== existing?.confirmationWorkflowId) await AssignmentWorkflowHelper.validateWorkflow(au.churchId, plan.confirmationWorkflowId, this.repos);
         if ((plan.ministryId || !existing) && !await PlanAuth.canEditMinistry(au, plan.ministryId)) return this.json({}, 401);
       }
 
@@ -387,6 +423,7 @@ export class PlanController extends DoingBaseController {
         // Sync reminder occurrences (planType-scoped serving reminders) without waiting for midnight.
         promises.push(this.repos.plan.save(plan).then(async (saved) => {
           await InternalEventBus.publish(au.churchId, "plan.updated", saved);
+          await this.applyLessonTrim(au.churchId, saved, previousPaths.get(plan));
           return saved;
         }));
       });
@@ -395,6 +432,22 @@ export class PlanController extends DoingBaseController {
       // Return single object if input was single object, array if input was array
       return Array.isArray(req.body) ? result : result[0];
     });
+  }
+
+  // New lesson-linked plans get the plan type's saved trim. A changed lesson link re-trims only when nothing was added by hand
+  // and every lesson row still points at the old lesson. previousPath undefined = the plan is new.
+  private async applyLessonTrim(churchId: string, plan: Plan, previousPath: string | null | undefined) {
+    if (!plan.providerPlanId || previousPath === plan.providerPlanId) return;
+    let force = false;
+    if (previousPath !== undefined) {
+      const rows = (await this.repos.planItem.loadForPlan(churchId, plan.id!)) as PlanItem[];
+      const handAdded = rows.some((r) => !r.providerId && r.itemType !== "header");
+      if (handAdded || rows.some((r) => r.providerId && r.providerPath === plan.providerPlanId)) return;
+      force = rows.length > 0;
+    }
+    const full = (await this.repos.plan.load(churchId, plan.id!)) as Plan;
+    const trimmed = full ? await LessonTrimHelper.apply(this.repos, churchId, full, { force }) : null;
+    if (trimmed) plan.lessonTrimWarning = trimmed.warning;
   }
 
   @httpDelete("/:id")

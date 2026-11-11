@@ -1,10 +1,14 @@
 import { DateHelper } from "@churchapps/apihelper";
 import { Repos } from "../repositories/index.js";
 import { Task, WorkflowStep, WorkflowStepAction } from "../models/index.js";
-import { getMembershipModuleGateway, getMessagingModuleGateway } from "../../../shared/modules/index.js";
+import { getAttendanceModuleGateway, getMembershipModuleGateway, getMessagingModuleGateway } from "../../../shared/modules/index.js";
 import { UrlValidator } from "../../../shared/webhooks/UrlValidator.js";
 import { SafeHttp } from "../../../shared/webhooks/SafeHttp.js";
+import { NotificationService } from "../../../shared/helpers/NotificationService.js";
+import { Environment } from "../../../shared/helpers/Environment.js";
+import { AssignmentWorkflowHelper } from "./AssignmentWorkflowHelper.js";
 import { WorkflowHelper } from "./WorkflowHelper.js";
+import { DonationMergeHelper } from "./DonationMergeHelper.js";
 
 interface HistoryEntry {
   date: string;
@@ -22,9 +26,31 @@ export class StepActionHelper {
   // Returns true when parked (a delay); startIndex resumes after a wake.
   public static async execute(task: Task, step: WorkflowStep, repos: Repos, startIndex = 0, depth = 0): Promise<boolean> {
     const actions = (await repos.workflowStepAction.loadForStep(task.churchId || "", step.id || "")) as WorkflowStepAction[];
+    if (task.assignmentId) {
+      const data = this.parseData(task);
+      for (const [id, state] of Object.entries(data.actionAttempts || {})) {
+        if (state === "started") {
+          data.actionAttempts[id] = "unknown";
+          task.data = JSON.stringify(data);
+          this.appendHistory(task, "Previous action outcome unknown; review delivery history before retrying");
+          Object.assign(data, this.parseData(task));
+        }
+      }
+      task.data = JSON.stringify(data);
+    }
     for (let i = startIndex; i < actions.length; i++) {
       const action = actions[i];
       const config = this.parseConfig(action.config);
+      if (await AssignmentWorkflowHelper.stopIfResolved(task, repos)) return true;
+      if (task.assignmentId && action.actionType !== "delay") {
+        const data = this.parseData(task);
+        const key = action.id || `${step.id}:${i}`;
+        if (data.actionAttempts?.[key]) continue;
+        data.actionAttempts = { ...data.actionAttempts, [key]: "started" };
+        data.actionCursor = { stepId: step.id, index: i + 1 };
+        task.data = JSON.stringify(data);
+        await repos.task.save(task); // checkpoint before side effect, including human task creation
+      }
       try {
         switch (action.actionType) {
           case "delay": {
@@ -43,14 +69,22 @@ export class StepActionHelper {
           case "webhook":
             await this.fireWebhook(task, config);
             break;
+          case "sendAssignmentRequest":
+            await AssignmentWorkflowHelper.send(task, config, repos);
+            break;
           case "sendEmail":
+            if (task.assignmentId) throw new Error("Use a serving request message for assignment confirmation");
             await this.sendEmail(task, config);
             break;
           case "sendText":
+            if (task.assignmentId) throw new Error("Use a serving request message for assignment confirmation");
             await this.sendText(task, config);
             break;
           case "addToGroup":
             await this.addToGroup(task, config);
+            break;
+          case "recordAttendance":
+            await this.recordAttendance(task, config);
             break;
           case "removeFromGroup":
             await this.removeFromGroup(task, config);
@@ -64,6 +98,9 @@ export class StepActionHelper {
           case "createTask":
             await this.createTask(task, config, repos);
             break;
+          case "notifyPerson":
+            await this.notifyPerson(task, step, config, repos);
+            break;
           default:
             break;
         }
@@ -71,6 +108,12 @@ export class StepActionHelper {
         const message = (err as Error)?.message || String(err);
         this.appendHistory(task, `Action ${action.actionType} failed: ${message}`);
         console.warn(`[StepActionHelper] action ${action.actionType} failed for card ${task.id || "?"}:`, message);
+      }
+      if (task.assignmentId && action.actionType !== "delay") {
+        const data = this.parseData(task);
+        data.actionAttempts[action.id || `${step.id}:${i}`] = "finished";
+        task.data = JSON.stringify(data);
+        await repos.task.save(task);
       }
     }
     this.clearActionCursor(task);
@@ -149,13 +192,15 @@ export class StepActionHelper {
     const person = await membership.loadPerson(task.churchId || "", task.associatedWithId);
     if (!person?.email) return;
     const church = await membership.loadChurch(task.churchId || "");
+    const extras = await DonationMergeHelper.extras(task.churchId || "", this.parseData(task).event, "html");
     const sent = await getMessagingModuleGateway().sendTemplatedEmail(
       task.churchId || "",
       task.associatedWithId,
       config.templateId,
       { email: person.email, firstName: person.firstName, lastName: person.lastName, displayName: person.displayName || task.associatedWithLabel },
       church?.name || "B1",
-      config.subject
+      config.subject,
+      extras
     );
     if (sent) this.appendHistory(task, "Email sent");
   }
@@ -166,14 +211,19 @@ export class StepActionHelper {
     const membership = getMembershipModuleGateway();
     const person = await membership.loadPerson(task.churchId || "", task.associatedWithId);
     const phoneNumber = (person?.mobilePhone || "").trim();
-    if (!person || !phoneNumber) return;
+    if (!person) return;
+    if (!phoneNumber) {
+      this.appendHistory(task, "Text skipped: no mobile phone");
+      return;
+    }
     if (person.optedOut === true || person.optedOut === 1) {
       this.appendHistory(task, "Text skipped: opted out");
       return;
     }
     const church = await membership.loadChurch(task.churchId || "");
     const recipient = { phoneNumber, firstName: person.firstName, lastName: person.lastName, displayName: person.displayName || task.associatedWithLabel };
-    const result = await getMessagingModuleGateway().sendPersonText(task.churchId || "", task.associatedWithId, recipient, config.message, church?.name || "B1");
+    const extras = await DonationMergeHelper.extras(task.churchId || "", this.parseData(task).event, "text");
+    const result = await getMessagingModuleGateway().sendPersonText(task.churchId || "", task.associatedWithId, recipient, config.message, church?.name || "B1", extras);
     if (!result.ok) throw new Error(result.reason || "send failed");
     this.appendHistory(task, "Text sent");
   }
@@ -182,6 +232,15 @@ export class StepActionHelper {
     if (task.associatedWithType !== "person" || !task.associatedWithId || !config.groupId) return;
     await getMembershipModuleGateway().addGroupMember(task.churchId || "", config.groupId, task.associatedWithId);
     this.appendHistory(task, config.groupLabel ? `Added to group: ${config.groupLabel}` : "Added to group");
+  }
+
+  // Measured at the card's creation (the trigger moment) so an earlier Wait step can't push it past the service.
+  private static async recordAttendance(task: Task, config: Record<string, any>): Promise<void> {
+    if (task.associatedWithType !== "person" || !task.associatedWithId || !config.groupId) return;
+    const at = task.dateCreated ? new Date(task.dateCreated) : new Date();
+    const count = await getAttendanceModuleGateway().recordAttendance(task.churchId || "", task.associatedWithId, config.groupId, at);
+    if (count > 0) this.appendHistory(task, config.groupLabel ? `Attendance recorded: ${config.groupLabel}` : "Attendance recorded");
+    else this.appendHistory(task, "No scheduled service in progress — attendance not recorded");
   }
 
   private static async removeFromGroup(task: Task, config: Record<string, any>): Promise<void> {
@@ -193,8 +252,9 @@ export class StepActionHelper {
   // Creates a standalone (non-card) task about the card's person, assigned per config.
   private static async createTask(task: Task, config: Record<string, any>, repos: Repos): Promise<void> {
     if (!config.title) return;
-    await repos.task.save({
+    const child = await repos.task.save({
       churchId: task.churchId,
+      assignmentId: task.assignmentId,
       taskType: "FollowUp",
       dateCreated: new Date(),
       associatedWithType: task.associatedWithType,
@@ -207,12 +267,28 @@ export class StepActionHelper {
       assignedToLabel: config.assignedToLabel,
       title: config.title,
       status: "Open",
-      data: config.description ? JSON.stringify({ description: config.description }) : undefined
+      dueDate: config.dueDays ? DateHelper.addDays(new Date(), Number(config.dueDays)) : undefined,
+      data: JSON.stringify({ description: config.description, assignment: this.parseData(task).assignment, parentCardId: task.id, ...(task.assignmentId ? { history: [{ date: new Date().toISOString(), message: "Created by serving confirmation workflow" }] } : {}) })
     });
-    this.appendHistory(task, `Task created: ${config.title}`);
+    this.appendHistory(task, `Task created: ${config.title} (${child.id || ""})`);
+  }
+
+  // Emails and notifies a chosen staff person about the card. Uses only the card's
+  // person, workflow/step names and the church's message, never giving data.
+  // The message is church-written, so the email draws on ChurchEmailLimiter like the Send Email step.
+  private static async notifyPerson(task: Task, step: WorkflowStep, config: Record<string, any>, repos: Repos): Promise<void> {
+    if (!config.personId) return;
+    const workflow = task.workflowId ? await repos.workflow.load(task.churchId || "", task.workflowId) : null;
+    const subject = task.associatedWithLabel || task.title || "Card";
+    const where = [workflow?.name, step.name].filter(Boolean).join(": ");
+    const text = [where ? `${subject} — ${where}` : subject, config.message?.trim()].filter(Boolean).join(". ");
+    const link = (Environment.b1AdminRoot || "https://admin.b1.church").replace(/\/$/, "") + "/serving/tasks/" + task.id;
+    await NotificationService.createNotifications([config.personId], task.churchId || "", "task", task.id || "", text, link, undefined, { emailImmediate: true, churchAuthored: true, deliveryTitle: "Workflow: " + (step.name || "") });
+    this.appendHistory(task, `Notified ${config.personLabel || "person"}`);
   }
 
   private static async addToWorkflow(task: Task, config: Record<string, any>, repos: Repos, depth: number): Promise<void> {
+    if (task.assignmentId) { this.appendHistory(task, "Workflow handoff skipped: serving confirmation must retain its assignment"); return; }
     if (task.associatedWithType !== "person" || !task.associatedWithId || !config.workflowId) return;
     await WorkflowHelper.addToWorkflow(
       task.churchId || "",

@@ -5,7 +5,7 @@ export class Permissions extends BasePermissions {
 
   static groupMembers = { view: { contentType: "Group Members", action: "View" }, edit: { contentType: "Group Members", action: "Edit" } };
 
-  static people = { view: { contentType: "People", action: "View" }, viewMembers: { contentType: "People", action: "View Members" }, edit: { contentType: "People", action: "Edit" }, editSelf: { contentType: "People", action: "Edit Self" }, viewConfidentialNotes: { contentType: "People", action: "View Confidential Notes" } };
+  static people = { view: { contentType: "People", action: "View" }, viewMembers: { contentType: "People", action: "View Members" }, viewNames: { contentType: "People", action: "View Names" }, edit: { contentType: "People", action: "Edit" }, editSelf: { contentType: "People", action: "Edit Self" }, viewConfidentialNotes: { contentType: "People", action: "View Confidential Notes" } };
 
   static forms = { admin: { contentType: "Forms", action: "Admin" }, edit: { contentType: "Forms", action: "Edit" } };
 
@@ -19,7 +19,7 @@ export class Permissions extends BasePermissions {
 
   static services = { edit: { contentType: "Services", action: "Edit" } };
 
-  static donations = { viewSummary: { contentType: "Donations", action: "View Summary" }, edit: { contentType: "Donations", action: "Edit" }, view: { contentType: "Donations", action: "View" } };
+  static donations = { viewSummary: { contentType: "Donations", action: "View Summary" }, edit: { contentType: "Donations", action: "Edit" }, enter: { contentType: "Donations", action: "Enter" }, view: { contentType: "Donations", action: "View" } };
 
   static settings = { edit: { contentType: "Settings", action: "Edit" }, view: { contentType: "Settings", action: "View" } };
 
@@ -50,6 +50,7 @@ export const permissionsList: IPermission[] = [
   { apiName: "AttendanceApi", section: "Attendance", action: "View Summary", displaySection: "Attendance", displayAction: "View Attendance Summary" },
 
   { apiName: "GivingApi", section: "Donations", action: "Edit", displaySection: "Donations", displayAction: "Edit Donations" },
+  { apiName: "GivingApi", section: "Donations", action: "Enter", displaySection: "Donations", displayAction: "Enter Donations" },
   { apiName: "GivingApi", section: "Settings", action: "Edit", displaySection: "Donations", displayAction: "Edit Settings" },
   { apiName: "GivingApi", section: "Donations", action: "View Summary", displaySection: "Donations", displayAction: "View Donation Summaries" },
   { apiName: "GivingApi", section: "Donations", action: "View", displaySection: "Donations", displayAction: "View Donations" },
@@ -64,6 +65,7 @@ export const permissionsList: IPermission[] = [
   { apiName: "MembershipApi", section: "Roles", action: "Edit", displaySection: "People and Groups", displayAction: "Edit Roles and Users" },
   { apiName: "MembershipApi", section: "Group Members", action: "View", displaySection: "People and Groups", displayAction: "View Group Members" },
   { apiName: "MembershipApi", section: "People", action: "View Members", displaySection: "People and Groups", displayAction: "View Members Only" },
+  { apiName: "MembershipApi", section: "People", action: "View Names", displaySection: "People and Groups", displayAction: "View People Names Only" },
   { apiName: "MembershipApi", section: "People", action: "View", displaySection: "People and Groups", displayAction: "View People" },
   { apiName: "MembershipApi", section: "People", action: "View Confidential Notes", displaySection: "People and Groups", displayAction: "View Confidential Notes" },
   { apiName: "MembershipApi", section: "Roles", action: "View", displaySection: "People and Groups", displayAction: "View Roles and Users" },
@@ -128,4 +130,4 @@ export type ContentType =
   | "Schedules"
   | "Calendars";
 
-export type Actions = "Admin" | "Edit" | "View" | "Send" | "Edit Self" | "View Members" | "View Summary" | "Checkin" | "Host" | "Edit Settings" | "View Confidential Notes";
+export type Actions = "Admin" | "Edit" | "Enter" | "View" | "Send" | "Edit Self" | "View Members" | "View Names" | "View Summary" | "Checkin" | "Host" | "Edit Settings" | "View Confidential Notes";

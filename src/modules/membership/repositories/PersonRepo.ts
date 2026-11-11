@@ -41,6 +41,8 @@ export class PersonRepo {
 
   private async create(person: Person): Promise<Person> {
     person.id = UniqueIdHelper.shortId();
+    // Stamped by the server on insert only; any client-supplied value is ignored.
+    person.dateAdded = new Date();
     this.prepareDateFields(person);
     this.prepareContactFields(person);
     const p = person as any;
@@ -79,6 +81,7 @@ export class PersonRepo {
       nametagNotes: person.nametagNotes,
       donorNumber: person.donorNumber,
       importKey: person.importKey,
+      dateAdded: person.dateAdded,
       removed: false
     }).execute();
     return person;
@@ -160,17 +163,17 @@ export class PersonRepo {
   }
 
   public async loadAll(churchId: string) {
-    return getDb().selectFrom("people").selectAll().where("churchId", "=", churchId).where("removed", "=", false as any).execute();
+    return getDb().selectFrom("people").selectAll().where("churchId", "=", churchId).where("removed", "=", false as any).orderBy("lastName", "asc").orderBy("firstName", "asc").execute();
   }
 
   public async loadByIds(churchId: string, ids: string[]) {
     if (!ids.length) return [];
-    return getDb().selectFrom("people").selectAll().where("id", "in", ids).where("churchId", "=", churchId).execute();
+    return getDb().selectFrom("people").selectAll().where("id", "in", ids).where("churchId", "=", churchId).orderBy("lastName", "asc").orderBy("firstName", "asc").execute();
   }
 
   public async loadByIdsOnly(ids: string[]) {
     if (!ids.length) return [];
-    return getDb().selectFrom("people").selectAll().where("id", "in", ids).execute();
+    return getDb().selectFrom("people").selectAll().where("id", "in", ids).orderBy("lastName", "asc").orderBy("firstName", "asc").execute();
   }
 
   public async loadMembers(churchId: string) {
@@ -178,6 +181,7 @@ export class PersonRepo {
       .where("churchId", "=", churchId)
       .where("removed", "=", false as any)
       .where("membershipStatus", "in", ["Member", "Staff"])
+      .orderBy("lastName", "asc").orderBy("firstName", "asc")
       .execute();
   }
 
@@ -195,6 +199,7 @@ export class PersonRepo {
       .where("removed", "=", false as any)
       .where("membershipStatus", "in", statuses)
       .where((eb) => eb.or([eb("optedOut", "=", false as any), eb("optedOut", "is", null)]))
+      .orderBy("lastName", "asc").orderBy("firstName", "asc")
       .execute();
   }
 
@@ -203,13 +208,8 @@ export class PersonRepo {
       .where("churchId", "=", churchId)
       .where("removed", "=", false as any);
     if (filterOptedOut) q = q.where((eb) => eb.or([eb("optedOut", "=", false as any), eb("optedOut", "is", null)]));
-    const subResult = await q.orderBy("id", "desc").limit(25).execute();
-    subResult.sort((a: any, b: any) => {
-      const lastCmp = (a.lastName || "").localeCompare(b.lastName || "");
-      if (lastCmp !== 0) return lastCmp;
-      return (a.firstName || "").localeCompare(b.firstName || "");
-    });
-    return subResult;
+    // Ids are random shortIds, so order by dateAdded (newest first, older NULL rows last).
+    return q.orderBy(sql`dateAdded IS NULL`).orderBy("dateAdded", "desc").orderBy("id", "desc").limit(25).execute();
   }
 
   public async loadAlphabetical(churchId: string, pageSize: number, filterOptedOut?: boolean) {
@@ -227,6 +227,7 @@ export class PersonRepo {
       .where("churchId", "=", churchId)
       .where("householdId", "=", householdId)
       .where("removed", "=", false as any)
+      .orderBy("lastName", "asc").orderBy("firstName", "asc")
       .execute();
   }
 
@@ -237,7 +238,7 @@ export class PersonRepo {
       .where(sql`CONCAT(IFNULL(FirstName,''), ' ', IFNULL(MiddleName,''), ' ', IFNULL(NickName,''), ' ', IFNULL(LastName,''), ' ', IFNULL(donorNumber,''))`, "like", searchTerm)
       .where("removed", "=", 0 as any);
     if (filterOptedOut) query = query.where((eb) => eb.or([eb("optedOut", "=", false as any), eb("optedOut", "is", null)]));
-    return query.limit(100).execute();
+    return query.orderBy("lastName", "asc").orderBy("firstName", "asc").limit(100).execute();
   }
 
   public async searchPhone(churchId: string, phonestring: string) {
@@ -250,6 +251,7 @@ export class PersonRepo {
         eb(sql`REPLACE(REPLACE(MobilePhone,'-',''), ' ', '')`, "like", phoneSearch)
       ]))
       .where("removed", "=", 0 as any)
+      .orderBy("lastName", "asc").orderBy("firstName", "asc")
       .limit(100)
       .execute();
   }
@@ -259,6 +261,7 @@ export class PersonRepo {
       .where("churchId", "=", churchId)
       .where("email", "like", "%" + email + "%")
       .where("removed", "=", false as any)
+      .orderBy("lastName", "asc").orderBy("firstName", "asc")
       .limit(100)
       .execute() as any;
   }
@@ -317,8 +320,36 @@ export class PersonRepo {
         }
         return eb.or(clauses);
       })
+      .orderBy("lastName", "asc").orderBy("firstName", "asc")
       .limit(25)
       .execute();
+  }
+
+  // QR guest sign-up: the one live person with the same first name and the same email or phone.
+  // Two or more matches (or none) return null so the caller creates a new person instead of guessing.
+  public async findGuestMatch(churchId: string, params: { firstName: string; email?: string; phone?: string }) {
+    const firstName = params.firstName?.trim().toLowerCase();
+    const email = params.email?.trim().toLowerCase();
+    const phoneDigits = (params.phone || "").replace(/\D/g, "");
+    if (!firstName || (!email && !phoneDigits)) return null;
+
+    const rows = await getDb().selectFrom("people").selectAll()
+      .where("churchId", "=", churchId)
+      .where("removed", "=", false as any)
+      .where(sql`LOWER(TRIM(FirstName))`, "=", firstName)
+      .where((eb) => {
+        const clauses = [];
+        if (email) clauses.push(eb(sql`LOWER(email)`, "=", email));
+        if (phoneDigits) {
+          clauses.push(eb(this.phoneDigitsSql("HomePhone"), "=", phoneDigits));
+          clauses.push(eb(this.phoneDigitsSql("WorkPhone"), "=", phoneDigits));
+          clauses.push(eb(this.phoneDigitsSql("MobilePhone"), "=", phoneDigits));
+        }
+        return eb.or(clauses);
+      })
+      .limit(2)
+      .execute();
+    return rows.length === 1 ? rows[0] : null;
   }
 
   public async loadAttendees(churchId: string, campusId: string, serviceId: string, serviceTimeId: string, categoryName: string, groupId: string, startDate: Date, endDate: Date) {
@@ -436,6 +467,7 @@ export class PersonRepo {
       grade: row.grade,
       school: row.school,
       photoUpdated: row.photoUpdated ? new Date(row.photoUpdated) : undefined,
+      dateAdded: row.dateAdded ? new Date(row.dateAdded) : undefined,
       id: row.id,
       churchId: row.churchId,
       importKey: row.importKey,
@@ -477,6 +509,29 @@ export class PersonRepo {
       photo: data.photo,
       photoUpdated: data.photoUpdated ? new Date(data.photoUpdated) : undefined,
       membershipStatus: data.membershipStatus,
+      id: data.id
+    };
+    if (result.photo === undefined) result.photo = PersonHelper.getPhotoPath(churchId, result);
+    return result;
+  }
+
+  public convertAllToCheckinModel(churchId: string, data: any) {
+    return CollectionHelper.convertAll<Person>(data, (d: any) => this.convertToCheckinModel(churchId, d));
+  }
+
+  // What a check-in kiosk needs to find a family, pick eligible groups and print labels. Nothing else from the record.
+  public convertToCheckinModel(churchId: string, data: any) {
+    const result: Person = {
+      name: { display: data.displayName, first: data.firstName, last: data.lastName, nick: data.nickName },
+      contactInfo: {},
+      photo: data.photo,
+      photoUpdated: data.photoUpdated ? new Date(data.photoUpdated) : undefined,
+      membershipStatus: data.membershipStatus,
+      householdId: data.householdId,
+      householdRole: data.householdRole,
+      birthDate: data.birthDate,
+      grade: data.grade,
+      nametagNotes: data.nametagNotes,
       id: data.id
     };
     if (result.photo === undefined) result.photo = PersonHelper.getPhotoPath(churchId, result);

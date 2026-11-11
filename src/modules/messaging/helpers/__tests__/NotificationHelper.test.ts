@@ -34,7 +34,16 @@ jest.mock("@churchapps/apihelper", () => ({
 }));
 
 // Environment: import.meta.url can't be parsed by CommonJS Jest.
-jest.mock("../../../../shared/helpers/Environment.js", () => ({ Environment: { getEnvironmentName: () => "test" } }));
+jest.mock("../../../../shared/helpers/Environment.js", () => ({ Environment: { getEnvironmentName: () => "test", b1AdminRoot: "https://admin.example.org/" } }));
+
+// Content gateway: event notes link through the event's group.
+const loadEventMock = jest.fn() as jest.MockedFunction<any>;
+jest.mock("../../../../shared/modules/ContentModuleGateway.js", () => ({ getContentModuleGateway: () => ({ loadEvent: loadEventMock }) }));
+
+// Membership gateway: the sender display name comes from the church record.
+const loadChurchMock = jest.fn() as jest.MockedFunction<any>;
+loadChurchMock.mockResolvedValue({ id: "CHU1", name: "Grace Church" });
+jest.mock("../../../../shared/modules/MembershipModuleGateway.js", () => ({ getMembershipModuleGateway: () => ({ loadChurch: loadChurchMock }) }));
 
 // axios: unused on the socket/push escalation path under test.
 jest.mock("axios", () => ({ default: { post: jest.fn() }, post: jest.fn() }));
@@ -433,6 +442,7 @@ describe("NotificationHelper.sendEmailNotifications direct messages", () => {
   beforeEach(() => {
     sendTemplatedEmailMock.mockClear();
     sendTemplatedEmailMock.mockResolvedValue(undefined);
+    loadChurchMock.mockClear();
     apihelper.ArrayHelper.getIds.mockImplementation((arr: any[], field: string) => [...new Set((arr || []).map((a) => a[field]).filter(Boolean))]);
     apihelper.ArrayHelper.getAll.mockImplementation((arr: any[], field: string, value: any) => (arr || []).filter((a) => a[field] === value));
     apihelper.ArrayHelper.getOne.mockImplementation((arr: any[], field: string, value: any) => (arr || []).find((a) => a[field] === value) || null);
@@ -483,6 +493,8 @@ describe("NotificationHelper.sendEmailNotifications direct messages", () => {
     const args = sendTemplatedEmailMock.mock.calls[0];
     expect(args[4]).toBe("New Message from Jane Doe"); // subject
     expect(args[7]).toBe("sender@example.com"); // reply-to
+    expect(args[0]).toBe('"Grace Church" <support@churchapps.org>'); // church name as sender display name
+    expect(loadChurchMock).toHaveBeenCalledWith("CHU1");
     expect(savedComplete.at(-1)?.deliveryMethod).toBe("complete");
     expect((result as any).pmsProcessed).toBeUndefined();
     spy.mockRestore();
@@ -518,6 +530,29 @@ describe("NotificationHelper.sendEmailNotifications direct messages", () => {
     expect(sendTemplatedEmailMock.mock.calls[1][1]).toBe("b@example.com");
     expect(sendTemplatedEmailMock.mock.calls[0][4]).toBe("New Notification: Please review this item");
     expect(sendTemplatedEmailMock.mock.calls[0][4]).not.toMatch(/[\r\n]/);
+    expect(sendTemplatedEmailMock.mock.calls[1][0]).toBe('"Grace Church" <support@churchapps.org>');
+    expect(loadChurchMock).toHaveBeenCalledTimes(1); // church resolved once per digest, not per address
+    spy.mockRestore();
+  });
+
+  it("falls back to the bare support address when the church lookup fails", async () => {
+    loadChurchMock.mockRejectedValueOnce(new Error("db down"));
+    const repos = {
+      notification: {
+        loadUndelivered: jest.fn(async () => [{ id: "N2", churchId: "CHU1", personId: "PER_B", contentType: "task", contentId: "T2", message: "Hello", category: "tasks" }]),
+        save: jest.fn(async (n) => n)
+      },
+      notificationPreference: { loadByPersonIds: jest.fn(async () => [{ personId: "PER_B", churchId: "CHU1", emailFrequency: "individual" }]) },
+      notificationPreferenceOverride: { loadByPersonIds: jest.fn(async () => []) },
+      deliveryLog: { save: jest.fn(async () => ({})) }
+    } as any;
+    NotificationHelper.init(repos);
+    const spy = jest.spyOn(NotificationHelper, "getEmailData").mockResolvedValue([{ id: "PER_B", email: "a@example.com" }] as any);
+
+    await NotificationHelper.sendEmailNotifications("individual");
+
+    expect(sendTemplatedEmailMock).toHaveBeenCalledTimes(1);
+    expect(sendTemplatedEmailMock.mock.calls[0][0]).toBe("support@churchapps.org");
     spy.mockRestore();
   });
 });
@@ -554,6 +589,46 @@ describe("NotificationHelper.createNotifications emailImmediate", () => {
     peopleInChurchSpy.mockRestore();
   });
 
+  it("keeps workflow-owned app alerts visible without an unread-email escalation", async () => {
+    const repos = buildRepos();
+    NotificationHelper.init(repos);
+    const result = await NotificationHelper.createNotifications(["PER1"], "CHU1", "assignment", "PLAN1", "Volunteer Requests: Sample service", undefined, undefined, { appOnly: true, category: "serving_schedule" });
+    expect(result[0]).toMatchObject({ deliveryMethod: "complete", isNew: true, category: "serving_schedule" });
+    expect(sendTemplatedEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("gates workflow emails by church membership and member preferences", async () => {
+    NotificationHelper.init(buildRepos({ pref: { emailFrequency: "never" } }));
+    expect(await NotificationHelper.sendWorkflowEmail("CHU1", "PER1", "CARD1", "volunteer@example.test", "S", "<p>Body</p>")).toContain("skipped");
+    NotificationHelper.init(buildRepos());
+    peopleInChurchSpy.mockResolvedValue([]);
+    expect(await NotificationHelper.sendWorkflowEmail("CHU1", "OTHER", "CARD1", "volunteer@example.test", "S", "<p>Body</p>")).toContain("not in this church");
+    expect(sendTemplatedEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps approval/rate-limited workflow emails out of the unread queue", async () => {
+    const repos = buildRepos(); NotificationHelper.init(repos);
+    const reserve = jest.spyOn(ChurchEmailLimiter, "reserve").mockResolvedValue(null);
+    try {
+      expect(await NotificationHelper.sendWorkflowEmail("CHU1", "PER1", "CARD1", "volunteer@example.test", "S", "<p>Body</p>")).toContain("blocked");
+      expect(sendTemplatedEmailMock).not.toHaveBeenCalled(); expect(repos.notification.save).not.toHaveBeenCalled();
+    } finally { reserve.mockRestore(); }
+  });
+
+  it("settles a workflow email reservation after a successful or uncertain transport attempt", async () => {
+    NotificationHelper.init(buildRepos());
+    const reserve = jest.spyOn(ChurchEmailLimiter, "reserve").mockResolvedValue(["reserve1"]);
+    const settle = jest.spyOn(ChurchEmailLimiter, "settle").mockResolvedValue(undefined);
+    try {
+      expect(await NotificationHelper.sendWorkflowEmail("CHU1", "PER1", "CARD1", "volunteer@example.test", "S", "<p>Body</p>")).toBe("sent");
+      expect(sendTemplatedEmailMock.mock.calls[0][0]).toBe('"Grace Church" <support@churchapps.org>');
+      expect(settle).toHaveBeenCalledWith("CHU1", "reserve1", true);
+      sendTemplatedEmailMock.mockRejectedValueOnce(new Error("transport timeout"));
+      await expect(NotificationHelper.sendWorkflowEmail("CHU1", "PER1", "CARD1", "volunteer@example.test", "S", "<p>Body</p>")).rejects.toThrow("timeout");
+      expect(settle).toHaveBeenCalledWith("CHU1", "reserve1", false, expect.stringContaining("timeout"));
+    } finally { reserve.mockRestore(); settle.mockRestore(); }
+  });
+
   it("drops recipients who are not in the notifying church", async () => {
     const repos = buildRepos();
     NotificationHelper.init(repos);
@@ -581,6 +656,7 @@ describe("NotificationHelper.createNotifications emailImmediate", () => {
 
     expect(sendTemplatedEmailMock).toHaveBeenCalledTimes(1);
     const args = sendTemplatedEmailMock.mock.calls[0];
+    expect(args[0]).toBe('"Grace Church" <support@churchapps.org>');
     expect(args[1]).toBe("per1@example.com");
     expect(args[4]).toBe("Custom subject");
     expect(args[5]).toBe("<p>Custom html</p>");
@@ -690,5 +766,109 @@ describe("NotificationHelper.createNotifications emailImmediate", () => {
 
     expect(sendTemplatedEmailMock).not.toHaveBeenCalled();
     expect(result[0].deliveryMethod).not.toBe("complete");
+  });
+});
+
+describe("NotificationHelper.sendEmailNotification volunteer requests", () => {
+  beforeEach(() => {
+    sendTemplatedEmailMock.mockClear();
+    sendTemplatedEmailMock.mockResolvedValue(undefined);
+    NotificationHelper.init({ notification: { save: jest.fn(async (n) => n) }, deliveryLog: { save: jest.fn(async () => ({})) } } as any);
+  });
+
+  it("keeps the position's period and breaks before the confirm line", async () => {
+    const notification = { id: "N1", churchId: "CHU1", personId: "PER1", contentType: "assignment", contentId: "A1", message: "Volunteer Requests: Oct 25, 2026 - Session 1 - Teacher. Please log in and confirm." } as any;
+
+    await NotificationHelper.sendEmailNotification("volunteer@example.com", [notification]);
+
+    expect(sendTemplatedEmailMock).toHaveBeenCalledTimes(1);
+    const content: string = sendTemplatedEmailMock.mock.calls[0][5];
+    expect(content.replace(/<[^>]+>/g, "")).not.toMatch(/Teacher\.Please/);
+    expect(content).toContain("<h4>Oct 25, 2026 - Session 1 - Teacher.</h4>");
+  });
+});
+
+describe("NotificationHelper.checkShouldNotify conversation message text", () => {
+  let createNotificationsSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    NotificationHelper.init({
+      message: {
+        loadLatestPerPerson: jest.fn(async () => [
+          { personId: "PER_A", messageType: "comment", timeSent: new Date("2026-10-30") },
+          { personId: "PER_B", messageType: "comment", timeSent: new Date("2026-10-31") }
+        ])
+      },
+      device: { loadForPerson: jest.fn(async () => []) }
+    } as any);
+    createNotificationsSpy = jest.spyOn(NotificationHelper, "createNotifications").mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    createNotificationsSpy.mockRestore();
+  });
+
+  const notify = async (conversation: any) => {
+    await NotificationHelper.checkShouldNotify({ id: "CONV1", churchId: "CHU1", contentId: "C1", ...conversation }, { id: "MSG1", churchId: "CHU1", conversationId: "CONV1" } as any, "PER_A");
+    return createNotificationsSpy.mock.calls[0][4];
+  };
+
+  it("adds the conversation title when there is one", async () => {
+    expect(await notify({ contentType: "task", title: "Task #12" })).toBe("New message: Task #12");
+  });
+
+  it("does not print null for a conversation with no title", async () => {
+    expect(await notify({ contentType: "task", title: null })).toBe("New message");
+  });
+
+  it("does not print null when a group name cannot be resolved and there is no title", async () => {
+    expect(await notify({ contentType: "group", title: null })).toBe("New message");
+  });
+});
+
+// #1495: a note notification should open the note where it was written.
+describe("NotificationHelper.checkShouldNotify note links (#1495)", () => {
+  let createNotificationsSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    NotificationHelper.init({
+      message: { loadLatestPerPerson: jest.fn(async () => [{ personId: "PER_B", messageType: "comment", timeSent: new Date("2026-10-31") }]) },
+      device: { loadForPerson: jest.fn(async () => []) }
+    } as any);
+    createNotificationsSpy = jest.spyOn(NotificationHelper, "createNotifications").mockResolvedValue([]);
+    loadEventMock.mockReset();
+  });
+
+  afterEach(() => {
+    createNotificationsSpy.mockRestore();
+  });
+
+  const linkFor = async (contentType: string) => {
+    await NotificationHelper.checkShouldNotify({ id: "CONV1", churchId: "CHU1", contentType, contentId: "C1", title: "Notes" } as any, { id: "MSG1", churchId: "CHU1", conversationId: "CONV1" } as any, "PER_A");
+    return createNotificationsSpy.mock.calls.at(-1)[5];
+  };
+
+  it("links event notes to the event's group calendar in B1 Admin", async () => {
+    loadEventMock.mockResolvedValue({ id: "C1", groupId: "G1" });
+    expect(await linkFor("eventNote")).toBe("https://admin.example.org/groups/G1?view=calendar");
+    expect(loadEventMock).toHaveBeenCalledWith("CHU1", "C1");
+  });
+
+  it("leaves an event note without a group unlinked", async () => {
+    loadEventMock.mockResolvedValue({ id: "C1" });
+    expect(await linkFor("eventNote")).toBeUndefined();
+  });
+
+  it("links person notes to the person's notes in B1 Admin", async () => {
+    expect(await linkFor("person")).toBe("https://admin.example.org/people/C1?view=notes");
+    expect(await linkFor("personConfidential")).toBe("https://admin.example.org/people/C1?view=notes");
+  });
+
+  it("links workflow card notes to the task in B1 Admin", async () => {
+    expect(await linkFor("workflowCard")).toBe("https://admin.example.org/serving/tasks/C1");
+  });
+
+  it("links group notes to the group's notes in the app", async () => {
+    expect(await linkFor("groupNote")).toBe("/mobile/groups/C1?openChat=1&chatTab=notes");
   });
 });

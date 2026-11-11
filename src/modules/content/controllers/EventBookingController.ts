@@ -49,6 +49,19 @@ export class EventBookingController extends ContentBaseController {
     });
   }
 
+  // Approvals history: decided requests, scoped the same way as /pending.
+  @httpGet("/resolved")
+  public async getResolved(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      let resolved = await this.repos.eventBooking.loadResolved(au.churchId);
+      if (!this.canResolve(au)) {
+        const groupIds = await this.loadRequesterGroupIds(au.churchId, au.personId);
+        resolved = resolved.filter((row: any) => groupIds.includes(row.roomId ? row.roomApprovalGroupId : row.resourceApprovalGroupId));
+      }
+      return resolved;
+    });
+  }
+
   @httpPost("/")
   public async save(req: express.Request<{}, {}, EventBooking[]>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
@@ -179,7 +192,7 @@ export class EventBookingController extends ContentBaseController {
       const target = booking.roomId ? (await this.repos.room.load(churchId, booking.roomId))?.name : (await this.repos.resource.load(churchId, booking.resourceId))?.name;
       const event = await this.repos.event.load(churchId, booking.eventId);
       const message = `Your request for ${target || "a room/resource"} for "${event?.title || "an event"}" was ${status}.`;
-      await NotificationService.createNotifications([booking.requestedBy], churchId, "eventBooking", booking.id, message);
+      await NotificationService.createNotifications([booking.requestedBy], churchId, "eventBooking", booking.id, message, "/mobile/myRequests");
     } catch (e) {
       console.error("[EventBookingController] Failed to notify requester:", e);
     }

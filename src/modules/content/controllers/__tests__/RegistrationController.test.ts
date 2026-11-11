@@ -9,20 +9,24 @@ jest.mock("../../helpers/index", () => ({
 jest.mock("../../../../shared/modules/index", () => ({
   getMembershipModuleGateway: () => ({
     loadPerson: jest.fn(async () => ({ householdId: "h1", email: "person@example.com" })),
-    loadChurch: jest.fn(async () => ({ name: "Grace" })),
+    loadChurch: jest.fn(async () => ({ name: "Grace", subDomain: "grace" })),
     loadHouseholdPeople: jest.fn(async () => [{ id: "p1", householdId: "h1" }, { id: "p1kid", householdId: "h1" }]),
     getOrCreateGuestPerson: jest.fn(async () => ({ personId: "guest1", householdId: "gh1", email: "guest@example.com" }))
   })
 }));
 jest.mock("../../../../shared/webhooks/index", () => ({ WebhookDispatcher: { emit: jest.fn() } }));
-jest.mock("../../../../shared/infrastructure/RepoManager", () => ({ RepoManager: { getRepos: jest.fn(async () => ({ gateway: {} })) } }));
+jest.mock("../../../../shared/infrastructure/RepoManager", () => ({ RepoManager: { getRepos: jest.fn(async () => ({ gateway: { loadAll: jest.fn(async () => [{ id: "g1", provider: "stripe" }]) } })) } }));
 jest.mock("../../../../shared/helpers/GatewayService", () => ({ GatewayService: { getGatewayForChurch: jest.fn(async () => ({ provider: "stripe", currency: "USD" })), prepareCharge: jest.fn(), processCharge: jest.fn() } }));
 const consume = jest.fn(async () => true);
 jest.mock("../../helpers/AnonymousRateLimiter", () => ({ AnonymousRateLimiter: { consume: (...args: any[]) => (consume as any)(...args), ipBucket: jest.fn(() => ({ key: "ip", max: 1 })), keyBucket: jest.fn(() => ({ key: "k", max: 1 })) } }));
-jest.mock("../../../../shared/helpers/Environment", () => ({ Environment: { b1AdminRoot: "https://app.test", supportEmail: "s@test" } }));
+jest.mock("../../../../shared/helpers/Environment", () => ({ Environment: { b1AdminRoot: "https://app.test", b1AppRoot: "https://{subdomain}.b1.test", supportEmail: "s@test" } }));
 
 import { RegistrationController } from "../RegistrationController.js";
 import { GatewayService } from "../../../../shared/helpers/GatewayService.js";
+import { RepoManager } from "../../../../shared/infrastructure/RepoManager.js";
+import { RegistrationHelper } from "../../helpers/index.js";
+import { Environment } from "../../../../shared/helpers/Environment.js";
+import { CaptchaPass } from "../../../../shared/helpers/CaptchaPass.js";
 
 const processCharge = GatewayService.processCharge as jest.Mock;
 
@@ -45,7 +49,7 @@ function makeController(opts: any = {}) {
     registrationSelectionChoice: { atomicInsertWithCapacityCheck: jest.fn(async () => opts.selOk ?? true), deleteForRegistration: jest.fn(), loadForRegistration: jest.fn(async () => []) },
     registrationPayment: { save: jest.fn(async (r: any) => r), deleteForRegistration: jest.fn(), loadForRegistration: jest.fn(async () => []) }
   };
-  const au = { churchId: "c1", personId: opts.auPersonId ?? "admin1", checkAccess: () => opts.checkAccess ?? true };
+  const au = { churchId: "c1", personId: opts.auPersonId ?? "admin1", leaderGroupIds: opts.leaderGroupIds ?? [], checkAccess: () => opts.checkAccess ?? true };
   const controller = new RegistrationController();
   (controller as any).repos = repos;
   (controller as any).actionWrapper = (_req: any, _res: any, action: any) => action(au);
@@ -72,7 +76,7 @@ describe("register — paid event", () => {
 
   it("charges the server-computed total (ignoring a tampered client amount) and records the payment", async () => {
     processCharge.mockResolvedValue({ success: true, transactionId: "tx1", data: { id: "tx1", status: "succeeded", currency: "usd" } });
-    const { controller, repos } = makeController({ types });
+    const { controller, repos } = makeController({ types, auPersonId: "p1" });
     const result = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p1", provider: "stripe", token: "tok", amount: 999, members: [{ firstName: "A", lastName: "B", registrationTypeId: "t1" }] } }, {});
     expect(processCharge).toHaveBeenCalledTimes(1);
     expect(processCharge.mock.calls[0][1].amount).toBe(45);
@@ -83,7 +87,7 @@ describe("register — paid event", () => {
 
   it("rolls back inserted rows and returns the gateway error when the charge declines", async () => {
     processCharge.mockResolvedValue({ success: false, error: "Card declined" });
-    const { controller, repos } = makeController({ types });
+    const { controller, repos } = makeController({ types, auPersonId: "p1" });
     const result = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p1", provider: "stripe", token: "tok", members: [{ firstName: "A", lastName: "B", registrationTypeId: "t1" }] } }, {});
     expect(result.status).toBe(400);
     expect(result.obj.error).toBe("Card declined");
@@ -94,7 +98,7 @@ describe("register — paid event", () => {
   it("applies a percent coupon before charging", async () => {
     processCharge.mockResolvedValue({ success: true, transactionId: "tx2", data: { id: "tx2", status: "succeeded" } });
     const coupon = { id: "cp1", discountType: "percent", value: 10, active: true };
-    const { controller } = makeController({ types, coupon });
+    const { controller } = makeController({ types, coupon, auPersonId: "p1" });
     await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p1", provider: "stripe", token: "tok", couponCode: "EARLYBIRD", members: [{ firstName: "A", lastName: "B", registrationTypeId: "t1" }] } }, {});
     expect(processCharge.mock.calls[0][1].amount).toBe(40.5);
   });
@@ -112,6 +116,52 @@ describe("register — paid event", () => {
     const result = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p1", provider: "stripe", token: "tok", couponCode: "X", members: [{ firstName: "A", lastName: "B", registrationTypeId: "t1" }] } }, {});
     expect(result.status).toBe(400);
     expect(result.obj.reason).toBe("inactive");
+  });
+});
+
+describe("register — guest captcha", () => {
+  const types = [{ id: "t1", name: "Adult", price: 30, active: true }];
+  const body = (extra: any = {}) => ({ churchId: "c1", eventId: "e1", provider: "stripe", token: "pm_1", guestInfo: { firstName: "G", lastName: "H", email: "g@x.com" }, members: [{ firstName: "G", lastName: "H", registrationTypeId: "t1" }], ...extra });
+
+  beforeEach(() => { Object.assign(Environment, { captchaEnforce: true, jwtSecret: "test-secret" }); });
+  afterEach(() => { Object.assign(Environment, { captchaEnforce: false, jwtSecret: undefined }); });
+
+  it("refuses a paid guest registration without a pass, before charging, and rolls it back", async () => {
+    const { controller, repos } = makeController({ types });
+    const result: any = await (controller as any).register({ body: body() }, {});
+    expect(result.status).toBe(403);
+    expect(processCharge).not.toHaveBeenCalled();
+    expect(repos.registration.delete).toHaveBeenCalled();
+  });
+
+  it("charges a paid guest registration that carries a valid pass", async () => {
+    processCharge.mockResolvedValue({ success: true, data: { status: "succeeded" }, transactionId: "tx1" });
+    const { controller } = makeController({ types });
+    const result: any = await (controller as any).register({ body: body({ captchaPass: CaptchaPass.create("c1") }) }, {});
+    expect(processCharge).toHaveBeenCalled();
+    expect(result.status).toBe("confirmed");
+  });
+
+  it("refuses a pass issued for another church", async () => {
+    const { controller } = makeController({ types });
+    const result: any = await (controller as any).register({ body: body({ captchaPass: CaptchaPass.create("other") }) }, {});
+    expect(result.status).toBe(403);
+    expect(processCharge).not.toHaveBeenCalled();
+  });
+
+  it("lets a guest join the waitlist without a pass, since nothing is charged", async () => {
+    const { controller } = makeController({ types, event: { id: "e1", registrationEnabled: true, capacity: 1, waitlistEnabled: true }, capacityOk: false });
+    const result: any = await (controller as any).register({ body: body() }, {});
+    expect(result.status).toBe("waitlisted");
+  });
+
+  it("does not ask a signed-in member for a pass", async () => {
+    processCharge.mockResolvedValue({ success: true, data: { status: "succeeded" }, transactionId: "tx1" });
+    const { controller } = makeController({ types });
+    (controller as any).authUser = () => ({ id: "u1", churchId: "c1", personId: "p1", checkAccess: () => false });
+    const result: any = await (controller as any).register({ body: body({ guestInfo: undefined, personId: "p1", members: [{ firstName: "A", lastName: "B", registrationTypeId: "t1" }] }) }, {});
+    expect(processCharge).toHaveBeenCalled();
+    expect(result.status).toBe("confirmed");
   });
 });
 
@@ -283,5 +333,73 @@ describe("guest registration privacy (M29)", () => {
     expect(result.personId).toBeUndefined();
     expect(result.householdId).toBeUndefined();
     expect(result.members[0].personId).toBeNull();
+  });
+});
+
+describe("event registrations for the event's group leaders", () => {
+  it("lets a leader of the event's group list its registrations", async () => {
+    const { controller } = makeController({ checkAccess: false, leaderGroupIds: ["g1"], event: { id: "e1", groupId: "g1" }, existingRegs: [{ id: "r1" }] });
+    const result: any = await (controller as any).getForEvent("e1", {}, {});
+    expect(result.map((r: any) => r.id)).toEqual(["r1"]);
+  });
+
+  it("refuses a leader of a different group", async () => {
+    const { controller } = makeController({ checkAccess: false, leaderGroupIds: ["g2"], event: { id: "e1", groupId: "g1" } });
+    const result: any = await (controller as any).getForEvent("e1", {}, {});
+    expect(result.status).toBe(401);
+  });
+});
+
+describe("issue 1417 — staff Add Attendee and pay later", () => {
+  const types = [{ id: "t1", price: "45.00", active: true }];
+
+  it("lets staff register another person on a paid type with a balance due and no charge", async () => {
+    const { controller } = makeController({ types, auPersonId: "admin1" });
+    const result: any = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p2", members: [{ personId: "p2", firstName: "Donald", lastName: "Clark", registrationTypeId: "t1" }] } }, {});
+    expect(processCharge).not.toHaveBeenCalled();
+    expect(result.status).toBe("pending");
+    expect(result.personId).toBe("p2");
+    expect(result.totalAmount).toBe(45);
+    expect(result.amountPaid).toBe(0);
+    expect(result.members[0].personId).toBe("p2");
+  });
+
+  it("keeps the person when staff add someone to a free event", async () => {
+    const { controller } = makeController({ auPersonId: "admin1" });
+    const result: any = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p2", members: [{ personId: "p2", firstName: "Sam", lastName: "Demo" }] } }, {});
+    expect(result.status).toBe("confirmed");
+    expect(result.personId).toBe("p2");
+    expect(result.members[0].personId).toBe("p2");
+  });
+
+  it("does not let a non-staff user register someone else", async () => {
+    const { controller } = makeController({ auPersonId: "p1", checkAccess: false });
+    const result: any = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", personId: "p2", members: [{ personId: "p2", firstName: "Sam", lastName: "Demo" }] } }, {});
+    expect(result.personId).toBeNull();
+  });
+
+  it("saves a paid registration as pending with a balance due when the church has no gateway", async () => {
+    (RepoManager.getRepos as jest.Mock).mockResolvedValueOnce({ gateway: { loadAll: jest.fn(async () => []) } });
+    const { controller } = makeController({ types, auPersonId: "" });
+    const result: any = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", guestInfo: { firstName: "G", lastName: "H", email: "g@x.com" }, members: [{ firstName: "G", lastName: "H", registrationTypeId: "t1" }] } }, {});
+    expect(processCharge).not.toHaveBeenCalled();
+    expect(result.status).toBe("pending");
+    expect(result.totalAmount).toBe(45);
+    expect(result.amountPaid).toBe(0);
+  });
+
+  it("still requires payment when the church has a gateway", async () => {
+    (RepoManager.getRepos as jest.Mock).mockResolvedValueOnce({ gateway: { loadAll: jest.fn(async () => [{ id: "g1", provider: "stripe" }]) } });
+    const { controller } = makeController({ types, auPersonId: "" });
+    const result: any = await (controller as any).register({ body: { churchId: "c1", eventId: "e1", guestInfo: { firstName: "G", lastName: "H", email: "g@x.com" }, members: [{ firstName: "G", lastName: "H", registrationTypeId: "t1" }] } }, {});
+    expect(result.status).toBe(400);
+  });
+
+  it("links the waitlist promotion email to the member registrations page", async () => {
+    const send = RegistrationHelper.sendWaitlistAvailabilityEmail as jest.Mock;
+    send.mockClear();
+    const { controller } = makeController({ existing: { id: "r1", churchId: "c1", eventId: "e1" }, promoted: { id: "r1", status: "pending", personId: "p2", totalAmount: 45, amountPaid: 0 } });
+    await (controller as any).promote("r1", { body: null }, {});
+    expect(send.mock.calls[0][3]).toBe("https://grace.b1.test/mobile/registrations");
   });
 });

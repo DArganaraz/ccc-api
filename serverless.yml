@@ -2,7 +2,7 @@ service: api
 
 frameworkVersion: "3"
 
-# ponytail: framework 3.40's schema predates nodejs22.x, so validation is permanent false-positive noise
+# ponytail: framework 3's runtime enum stops at nodejs20.x, so nodejs24.x validation is permanent false-positive noise
 configValidationMode: "off"
 
 custom:
@@ -11,11 +11,14 @@ custom:
   stageToLower:
     dev: dev
     demo: demo  
-    staging: staging
-    Staging: staging
     prod: prod
     Prod: prod
   envLower: ${self:custom.stageToLower.${self:custom.env}, self:custom.env}
+  # Custom domain that /mcp is mapped onto through the HTTP API (see McpApiMapping). Stages without one skip the mapping.
+  mcpDomain:
+    prod: api.churchapps.org
+    demo: api.demo.churchapps.org
+  mcpDomainCurrent: ${self:custom.mcpDomain.${self:custom.envLower}, ''}
   serverless-offline:
     httpPort: 8084
     websocketPort: 8087
@@ -32,13 +35,23 @@ custom:
 
 provider:
   name: aws
-  runtime: nodejs22.x
+  runtime: nodejs24.x
   stage: ${opt:stage, 'dev'}
   region: us-east-2
   memorySize: 1024
   timeout: 30
+  # Stop retaining Lambda log groups forever. Log levels are set per function under resources.extensions.
+  logRetentionInDays: 30
+  # HTTP API (v2) that serves /mcp only. The REST API renames WWW-Authenticate to x-amzn-remapped-www-authenticate on
+  # the way out, which hides the OAuth discovery hint MCP clients key off (ChurchAppsSupport#1318); HTTP APIs pass it through.
+  httpApi:
+    name: ${self:service}-${self:custom.envLower}-mcp
+    # 1.0 payload keeps the api-mapping prefix in event.path, so Express still sees /mcp behind the custom domain.
+    payload: "1.0"
   environment:
     STAGE: ${self:custom.env}
+    # Silence dotenv's promotional 'tip' line on every cold start, including calls inside shared packages.
+    DOTENV_CONFIG_QUIET: "true"
     ENVIRONMENT: ${self:custom.env}
     # App secrets and config loaded from SSM at deploy-time
     JWT_SECRET: ${ssm:/${self:custom.envLower}/jwtSecret, ''}
@@ -72,8 +85,10 @@ provider:
     PRAISECHARTS_CONSUMER_KEY: ${ssm:/${self:custom.envLower}/praiseChartsConsumerKey, ''}
     PRAISECHARTS_CONSUMER_SECRET: ${ssm:/${self:custom.envLower}/praiseChartsConsumerSecret, ''}
     GOOGLE_RECAPTCHA_SECRET_KEY: ${ssm:/${self:custom.envLower}/recaptcha-secret-key, ''}
+    # Guest giving refuses calls without a reCAPTCHA pass only when this is "true"
+    CAPTCHA_ENFORCE: ${ssm:/${self:custom.envLower}/captchaEnforce, 'false'}
     OPENROUTER_API_KEY: ${ssm:/${self:custom.envLower}/openRouterApiKey, ''}
-    OPENAI_API_KEY: ${ssm:/${self:custom.envLower}/openAiApiKey, ''}
+    OPENAI_API_KEY: ${ssm:/${self:custom.envLower}/openAIKey, ''}
 
     # Web Push (VAPID)
     WEB_PUSH_PUBLIC_KEY: ${ssm:/${self:custom.envLower}/webPushPublicKey, ''}
@@ -121,7 +136,7 @@ layers:
     name: ${self:service}-dependencies-${self:custom.env}
     description: Dependencies layer for ${self:service}
     compatibleRuntimes:
-      - nodejs22.x
+      - nodejs24.x
     retain: false
 
 functions:
@@ -160,6 +175,10 @@ functions:
           path: /api/{proxy+}
           method: ANY
           cors: *cors
+      # The HTTP API exists so /mcp's 401 keeps a real WWW-Authenticate header (see provider.httpApi). The api mapping strips
+      # its "mcp" key before route matching, so only a catch-all route receives the requests; Express still gets the full
+      # /mcp path from the 1.0 payload and handles CORS itself.
+      - httpApi: "*"
 
   socket:
     handler: lambda.socket
@@ -244,12 +263,24 @@ functions:
     timeout: 120
     vpc: ${self:custom.vpcSettings.current, ''}
     environment:
-      # Database connection for the webhook delivery outbox worker
+      # Webhook delivery outbox worker (membership) and scheduled push notifications (messaging)
       MEMBERSHIP_CONNECTION_STRING: ${ssm:/${self:custom.envLower}/membershipApi/connectionString, ''}
+      MESSAGING_CONNECTION_STRING: ${ssm:/${self:custom.envLower}/messagingApi/connectionString, ''}
     events:
       - schedule:
           rate: rate(1 minute)
           enabled: true
+
+  # Applies pending database migrations. Not wired to any event: the deploy workflows invoke it
+  # with `aws lambda invoke` after `serverless deploy`, since the prod databases are VPC-only.
+  migrate:
+    handler: lambda.migrate
+    layers:
+      - { Ref: DependenciesLambdaLayer }
+      - arn:aws:lambda:us-east-2:943013980633:layer:SentryNodeServerlessSDKv10:19
+    memorySize: 512
+    timeout: 900
+    vpc: ${self:custom.vpcSettings.current, ''}
 
   # SES identity notifications (Bounce + Complaint) for support@churchapps.org point at this topic; see ChurchEmailLimiter.
   sesFeedback:
@@ -270,7 +301,57 @@ plugins:
   - serverless-offline
 
 resources:
+  # Lambda advanced logging. Serverless v3 has no provider.logs.lambda (that is v4), so it is patched onto each function.
+  # JSON format maps console.debug/info/warn/error to levels; INFO drops console.debug, and systemLogLevel WARN drops
+  # the per-invocation START/END/REPORT lines (Duration/Errors metrics are unaffected).
+  # Add any new function here too.
+  extensions:
+    WebLambdaFunction:
+      Properties:
+        LoggingConfig: &lambdaLogging
+          LogFormat: JSON
+          ApplicationLogLevel: INFO
+          SystemLogLevel: WARN
+    SocketLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+    Timer15MinLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+    TimerMidnightLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+    TimerScheduledTasksLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+    TimerWebhooksLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+    MigrateLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+    SesFeedbackLambdaFunction:
+      Properties:
+        LoggingConfig: *lambdaLogging
+  Conditions:
+    HasMcpDomain:
+      Fn::Not:
+        - Fn::Equals:
+            - ${self:custom.mcpDomainCurrent}
+            - ""
   Resources:
+    # Routes <domain>/mcp* to the HTTP API; everything else keeps hitting the REST API through its empty base path mapping.
+    McpApiMapping:
+      Type: "AWS::ApiGatewayV2::ApiMapping"
+      Condition: HasMcpDomain
+      Properties:
+        DomainName: ${self:custom.mcpDomainCurrent}
+        ApiMappingKey: mcp
+        ApiId:
+          Ref: HttpApi
+        Stage:
+          Ref: HttpApiStage
+
     GatewayResponseDefault4XX:
       Type: "AWS::ApiGateway::GatewayResponse"
       Properties:

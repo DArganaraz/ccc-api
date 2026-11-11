@@ -20,10 +20,21 @@ describe("SongPackageHelper text readers", () => {
     expect(sectionLabel("Repeat Chorus")).toBe("Repeat Chorus");
     expect(sectionLabel("REPEAT CHORUS 1")).toBe("REPEAT CHORUS 1");
     expect(sectionLabel("Repeat after me")).toBeNull();
+    expect(SongPackageHelper.firstLine("Chorus\n[G] I'm [C] making melodies unto [D] You this day x3")).toBe("I'm making melodies unto You this day");
+    expect(SongPackageHelper.firstLine("Verse 1\nI will sing 3x")).toBe("I will sing");
+    expect(SongPackageHelper.firstLine("Verse 1\nExodus 20 and Matthew 5")).toBe("Exodus 20 and Matthew 5");
     expect(sectionLabel("[G](Hallelujah)")).toBeNull();
     expect(sectionLabel("[G]When the [D]music [A]fades")).toBeNull();
     const byOurSide = "(Verse 1)\n[A]We won't go\n\n(Bridge)\n[G / D / A / Bm]\n\n[G]When the [D]music [A]fades   Still [Bm]by our side\n\n(Chorus x2)\n[G]Your love is constant";
     expect(SongPackageHelper.draftForm(byOurSide)?.defaultOrder).toEqual(["Verse 1", "Bridge", "Chorus x2"]);
+  });
+
+  it("reads a bare Introduction as a heading the way Intro is, and keeps longer words as lyrics", () => {
+    expect(sectionLabel("Introduction")).toBe("Introduction");
+    expect(sectionLabel("INTRODUCTION")).toBe("INTRODUCTION");
+    expect(sectionLabel("Introductory")).toBeNull();
+    expect(SongPackageHelper.firstLine("Introduction\n[G]Mercy and grace")).toBe("Mercy and grace");
+    expect(SongPackageHelper.firstLine("Introductory line of the song")).toBe("Introductory line of the song");
   });
 
   it("reads {c: …} comments, trailing colons and a number run onto the heading as labels", () => {

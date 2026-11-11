@@ -8,6 +8,7 @@ import { Utils, Permissions, ChurchHelper, RoleHelper, Environment, HubspotHelpe
 import { Repos } from "../repositories/index.js";
 import { ArrayHelper } from "@churchapps/apihelper";
 import { TransactionalEmailHelper } from "../../../shared/helpers/TransactionalEmailHelper.js";
+import { CurrencyDefaults } from "../../../shared/helpers/CurrencyDefaults.js";
 
 const churchRegisterValidation = [
   body("name").notEmpty().withMessage("Select a church name"),
@@ -332,10 +333,16 @@ export class ChurchController extends MembershipBaseController {
         // create the church
         const savedChurch = (await this.repos.church.save(church)) as any;
         church = savedChurch;
+        // The SES vetting gate protects ChurchApps' sender reputation; a self-hosted SMTP server has no approver.
+        if (process.env.SELF_HOSTED || process.env.RAILWAY_ENVIRONMENT) await this.repos.church.setEmailApproved(savedChurch.id, true);
 
         // Configure church
         const instance = new RoleHelper(savedChurch.id, au.id);
         await instance.init(); // Setup roles and permissions
+
+        // Start giving on the country's currency instead of usd (#1483); a failed seed must not fail registration
+        const currency = CurrencyDefaults.currencyForCountry(church.country);
+        if (currency) await this.repos.setting.save({ churchId: savedChurch.id, keyName: "currency", value: currency, public: "1" } as any).catch((): null => null);
 
         const postInitPromises: Promise<any>[] = [];
         if (Environment.emailOnRegistration) {
@@ -377,6 +384,8 @@ export class ChurchController extends MembershipBaseController {
   public async select(req: express.Request<{}, {}, { churchId: string; subDomain: string }>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au?.id) return this.json({ message: "Unauthorized" }, 401);
+      // PersonHelper.claim needs an email to find or create the person; API keys authenticate without one.
+      if (!au.email) return this.json({ message: "Selecting a church requires a signed-in user" }, 401);
       // Any signed-in user may join a live church here - this is the member self-signup path.
       // authz-exempt: selection grants nothing beyond the role-less membership /people/claim already hands out
       let { churchId } = req.body;

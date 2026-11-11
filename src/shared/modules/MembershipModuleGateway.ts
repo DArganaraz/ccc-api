@@ -30,6 +30,10 @@ export interface MembershipModuleGateway {
   loadPersonIdsWithPermission(churchId: string, contentType: string, action: string): Promise<string[]>;
   loadHouseholdPeople(churchId: string, personIds: string[]): Promise<{ id: string; householdId: string }[]>;
   loadChurch(churchId: string): Promise<{ id: string; name: string; subDomain: string; timeZone?: string } | null>;
+  // The first campus (lowest id) with a time zone, for churches whose own timeZone was never set.
+  loadCampusTimeZone(churchId: string): Promise<string | null>;
+  // Every campus that has a time zone, keyed by campus id.
+  loadCampusTimeZones(churchId: string): Promise<Record<string, string>>;
   loadGroup(churchId: string, groupId: string): Promise<{ id: string; name: string; categoryName?: string; discussionsEnabled?: boolean | number; announcementsEnabled?: boolean | number } | null>;
   searchPersonByEmail(churchId: string, email: string): Promise<{ id: string; householdId: string; email: string }[]>;
   loadPerson(churchId: string, personId: string): Promise<{
@@ -47,6 +51,7 @@ export interface MembershipModuleGateway {
   loadListMemberPersonIds(churchId: string, listId: string): Promise<string[]>;
   loadSetting(churchId: string, keyName: string): Promise<string | null>;
   loadGroupsForCheckin(churchId: string, groupIds: string[]): Promise<CheckinGroup[]>;
+  loadActiveGroupIds(churchId: string, ids: string[]): Promise<string[]>;
   loadHouseholdAdults(churchId: string, personIds: string[]): Promise<HouseholdAdult[]>;
   anonymizePerson(churchId: string, personId: string): Promise<void>;
 }
@@ -122,8 +127,10 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
   private getDBValue(condition: ConditionInput) {
     let result = condition.value;
     switch (condition.value) {
+      case "{currentDay}": result = new Date().getDate().toString(); break;
       case "{currentMonth}": result = (new Date().getMonth() + 1).toString(); break;
       case "{prevMonth}":
+      case "{previousMonth}":
         result = new Date().getMonth().toString();
         if (result === "0") result = "12";
         break;
@@ -165,6 +172,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .where("churchId", "=", churchId)
       .where("removed", "=", 0)
       .where("id", "in", personIds)
+      .orderBy("lastName").orderBy("firstName")
       .execute();
   }
 
@@ -229,6 +237,31 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
   public async loadChurch(churchId: string) {
     const repos = await this.repos();
     return (await repos.church.loadById(churchId)) ?? null;
+  }
+
+  public async loadCampusTimeZone(churchId: string) {
+    const row = await this.getDb().selectFrom("campuses")
+      .select("timezone")
+      .where("churchId", "=", churchId)
+      .where("removed", "=", 0)
+      .where("timezone", "is not", null)
+      .where("timezone", "<>", "")
+      .orderBy("id")
+      .executeTakeFirst();
+    return row?.timezone || null;
+  }
+
+  public async loadCampusTimeZones(churchId: string) {
+    const rows = (await this.getDb().selectFrom("campuses")
+      .select(["id", "timezone"])
+      .where("churchId", "=", churchId)
+      .where("removed", "=", 0)
+      .where("timezone", "is not", null)
+      .where("timezone", "<>", "")
+      .execute()) as { id: string; timezone: string }[];
+    const result: Record<string, string> = {};
+    rows.forEach((r) => (result[r.id] = r.timezone));
+    return result;
   }
 
   public async loadGroup(churchId: string, groupId: string) {
@@ -326,6 +359,17 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .where("keyName", "=", keyName)
       .executeTakeFirst();
     return (row?.value as string) ?? null;
+  }
+
+  public async loadActiveGroupIds(churchId: string, ids: string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+    const rows = (await this.getDb().selectFrom("groups")
+      .select(["id"])
+      .where("churchId", "=", churchId)
+      .where("id", "in", ids)
+      .where("removed", "=", false as any)
+      .execute()) as any[];
+    return rows.map((r) => r.id);
   }
 
   public async loadGroupsForCheckin(churchId: string, groupIds: string[]): Promise<CheckinGroup[]> {

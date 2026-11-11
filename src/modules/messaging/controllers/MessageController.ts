@@ -40,7 +40,7 @@ export class MessageController extends MessagingBaseController {
       for (const message of req.body) {
         const convData = await this.repos.conversation.loadById(message.churchId, message.conversationId);
         const conv = convData ? this.repos.conversation.convertToModel(convData) : null;
-        if (!conv?.id || conv.allowAnonymousPosts !== true || !this.isAnonPublicConversation(conv) || this.isPersonNote(conv.contentType)) return this.json({ error: "Anonymous posting not allowed" }, 401);
+        if (!conv?.id || conv.allowAnonymousPosts !== true || !this.isAnonPublicConversation(conv) || this.isNote(conv.contentType)) return this.json({ error: "Anonymous posting not allowed" }, 401);
         message.id = undefined;
         message.personId = null;
         message.churchId = conv.churchId;
@@ -48,7 +48,7 @@ export class MessageController extends MessagingBaseController {
       req.body.forEach((message) => {
         promises.push(
           this.repos.message.save(message).then(async (savedMessage) => {
-            console.info("[chat-push] message saved", {
+            console.debug("[chat-push] message saved", {
               route: "/messaging/messages/send",
               churchId: savedMessage.churchId,
               conversationId: savedMessage.conversationId,
@@ -57,7 +57,7 @@ export class MessageController extends MessagingBaseController {
               messageType: savedMessage.messageType || "comment"
             });
             if (!savedMessage.personId) {
-              console.warn("[chat-push] anonymous send route saved message without personId", {
+              console.debug("[chat-push] anonymous send route saved message without personId", {
                 route: "/messaging/messages/send",
                 churchId: savedMessage.churchId,
                 conversationId: savedMessage.conversationId,
@@ -137,9 +137,10 @@ export class MessageController extends MessagingBaseController {
   @httpPost("/")
   public async save(req: express.Request<{}, {}, Message[]>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
+      const previous = new Map<string, any>();
       for (const message of req.body) {
         const conv = this.repos.conversation.convertToModel(await this.repos.conversation.loadById(au.churchId, message.conversationId));
-        if (this.isPersonNote(conv?.contentType) && !this.canViewPersonNotes(au, conv.contentType)) return this.json({}, 401);
+        if (this.isNote(conv?.contentType) && !(await this.canUseNotes(au, conv, "post"))) return this.json({}, 401);
         // New posts need posting rights; an edit's author already participated, so it keeps the author-or-staff rule below.
         if (!message.id && (!conv?.id || !(await this.canPost(au, conv)))) return this.json({}, 401);
         if (message.id) {
@@ -149,6 +150,7 @@ export class MessageController extends MessagingBaseController {
           if (!isOwner && !au.checkAccess(Permissions.content.edit)) return this.json({}, 401);
           message.personId = existing?.personId ?? null;
           message.displayName = existing?.displayName;
+          previous.set(message.id, existing);
         }
       }
       const promises: Promise<Message>[] = [];
@@ -159,7 +161,7 @@ export class MessageController extends MessagingBaseController {
         const shouldNotify = !message.id && message.messageType !== "subscription";
         promises.push(
           this.repos.message.save(message).then(async (savedMessage) => {
-            console.info("[chat-push] message saved", {
+            console.debug("[chat-push] message saved", {
               route: "/messaging/messages",
               churchId: savedMessage.churchId,
               conversationId: savedMessage.conversationId,
@@ -175,9 +177,10 @@ export class MessageController extends MessagingBaseController {
               this.repos.conversation.updateStats(message.conversationId)
             ]);
             const conv = this.repos.conversation.convertToModel(conversation);
+            const existing = message.id ? previous.get(message.id) : null;
 
-            // Fan out real-time delivery and notification escalation concurrently -
-            // both are independent side-effects that each make their own AWS/DB calls.
+            // Fan out real-time delivery, notification escalation and the note audit row concurrently -
+            // they are independent side-effects that each make their own AWS/DB calls.
             const room = contentRoom(conv?.contentType, conv?.contentId);
             await Promise.all([
               DeliveryHelper.sendConversationMessages({
@@ -192,7 +195,16 @@ export class MessageController extends MessagingBaseController {
                 action: "conversationActivity",
                 data: { contentType: conv.contentType, contentId: conv.contentId, conversationId: conv.id, kind: "message" }
               }) : Promise.resolve(),
-              shouldNotify ? NotificationHelper.checkShouldNotify(conv, savedMessage, savedMessage.personId || "anonymous") : Promise.resolve()
+              shouldNotify ? NotificationHelper.checkShouldNotify(conv, savedMessage, savedMessage.personId || "anonymous") : Promise.resolve(),
+              this.logNoteAudit(req, au, conv, existing ? "note_updated" : "note_saved", {
+                op: existing ? "update" : "create",
+                before: existing ? { content: existing.content, displayName: existing.displayName, timeSent: existing.timeSent } : null,
+                after: { content: savedMessage.content, displayName: savedMessage.displayName },
+                messageId: savedMessage.id,
+                conversationId: savedMessage.conversationId,
+                contentType: conv?.contentType,
+                contentId: conv?.contentId
+              })
             ]);
 
             return savedMessage;
@@ -250,17 +262,14 @@ export class MessageController extends MessagingBaseController {
   // Group / announcement conversations gate on group membership; DMs on being a
   // participant; staff with content.edit may always act (moderation).
   private async canParticipate(au: any, conv: any): Promise<boolean> {
-    if (this.isPersonNote(conv.contentType)) return this.canViewPersonNotes(au, conv.contentType);
+    if (this.isNote(conv.contentType)) return this.canUseNotes(au, conv, "post");
     if (au.checkAccess(Permissions.content.edit)) return true;
     if (conv.contentType === "group" || conv.contentType === "groupAnnouncement") {
       return !!conv.contentId && au.groupIds?.includes(conv.contentId);
     }
     if (conv.contentType === "streamingLive") return this.isAnonPublicConversation(conv);
     if (conv.contentType === "streamingLiveHost") return !!au.checkAccess(Permissions.chat.host);
-    if (conv.contentType === "privateMessage") {
-      const pm = (await this.repos.privateMessage.loadById(au.churchId, conv.contentId)) as any;
-      return !!pm && (pm.fromPersonId === au.personId || pm.toPersonId === au.personId);
-    }
+    if (conv.contentType === "privateMessage") return this.isPrivateMessageParticipant(au, conv);
     if (conv.contentType === "workflowCard") return this.canUseWorkflowCard(au, conv.contentId);
     return false;
   }
@@ -268,12 +277,20 @@ export class MessageController extends MessagingBaseController {
   // Staff with content.edit moderate anywhere; group leaders moderate their own group's
   // conversations. Person notes are never leader-moderated - they run through the notes RBAC.
   private async canModerate(au: any, conv: any): Promise<boolean> {
-    if (this.isPersonNote(conv?.contentType)) return this.canViewPersonNotes(au, conv.contentType);
+    if (this.isNote(conv?.contentType)) return this.canUseNotes(au, conv, "post");
     if (au.checkAccess(Permissions.content.edit)) return true;
     if (conv?.contentType === "group" || conv?.contentType === "groupAnnouncement") {
       return !!conv.contentId && !!au.leaderGroupIds?.includes(conv.contentId);
     }
     return false;
+  }
+
+  // Notes share this route with chat, which the universal audit opts out of, so note edits and deletes
+  // are logged here explicitly. Chat is never logged.
+  private async logNoteAudit(req: express.Request, au: any, conv: any, action: string, details: object) {
+    if (!this.isNote(conv?.contentType)) return;
+    const category = this.isPersonNote(conv.contentType) ? "person" : conv.contentType === "groupNote" ? "group" : "settings";
+    await this.writeAuditLog(req, au, category, action, "note", conv.contentId, details);
   }
 
   @httpDelete("/:id")
@@ -288,6 +305,15 @@ export class MessageController extends MessagingBaseController {
       if (!isOwner && !(await this.canModerate(au, conv))) {
         return this.json({ error: "Unauthorized" }, 401);
       }
+      await this.logNoteAudit(req, au, conv, "note_deleted", {
+        op: "delete",
+        before: { content: message.content, displayName: message.displayName, personId: message.personId, timeSent: message.timeSent },
+        after: null,
+        messageId: id,
+        conversationId: message.conversationId,
+        contentType: conv?.contentType,
+        contentId: conv?.contentId
+      });
       await this.repos.message.delete(au.churchId, id);
       await this.repos.conversation.updateStats(message.conversationId);
 

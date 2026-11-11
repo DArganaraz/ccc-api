@@ -125,7 +125,12 @@ export class BaseController extends CustomBaseController {
     "/attendance/checkin": { optOut: true },
     "/messaging/messages": { optOut: true },
     "/messaging/connections": { optOut: true },
-    "/messaging/devices": { optOut: true }
+    "/messaging/devices": { optOut: true },
+    // Read-only searches sent as POST (filters in the body); they change nothing.
+    "/membership/people/search": { optOut: true },
+    "/membership/people/advancedSearch": { optOut: true },
+    "/membership/churches/search": { optOut: true },
+    "/content/stock/search": { optOut: true }
   };
 
   // Per-entity audit for bulk endpoints (each touched id becomes one row).
@@ -388,6 +393,18 @@ export class BaseController extends CustomBaseController {
       // Return empty object instead of null for single entity queries
       return result === null ? {} : result;
     });
+  }
+
+  // One explicit audit row, for a controller whose route the registry opts out of (notes share the chat route).
+  protected async writeAuditLog(req: express.Request, au: AuthenticatedUser, category: string, action: string, entityType: string, entityId: string | undefined, details: object) {
+    if (!au?.churchId) return;
+    try {
+      const { AuditLogHelper } = await import("../../modules/membership/helpers/AuditLogHelper.js");
+      const repos = this.moduleName === "membership" ? (this as any).repos : await RepoManager.getRepos<any>("membership");
+      await AuditLogHelper.log(repos, au.churchId, au.id || "anonymous", category, action, entityType, entityId, AuditLogHelper.capDetails(details), AuditLogHelper.getClientIp(req), this.moduleName);
+    } catch (e) {
+      console.error("writeAuditLog failed:", e);
+    }
   }
 
   private async writeAnonAuditRow(req: express.Request, config: AuditRouteConfig, payload: any) {

@@ -22,6 +22,14 @@ describe("group attendance reports", () => {
       expect(sql).toMatch(/DATE_FORMAT\(s\.sessionDate, '%Y-%m-%d'\) as sessionDate/);
       expect(sql).not.toMatch(/:week/);
     });
+
+    // Groups with no service time record sessions with a null serviceTimeId.
+    it(`${keyName} keeps sessions that have no service time`, () => {
+      expect(sql).not.toMatch(/INNER JOIN serviceTimes/i);
+      expect(sql).not.toMatch(/INNER JOIN services/i);
+      expect(sql).toMatch(/LEFT JOIN serviceTimes st on st\.id=s\.serviceTimeId/);
+      expect(sql).toMatch(/LEFT JOIN services ser on ser\.id=st\.serviceId/);
+    });
   });
 });
 
@@ -37,8 +45,8 @@ describe("GroupAttendanceDownloadHelper.combine", () => {
         ]
       },
       { keyName: "groups", value: [{ id: "g2", groupName: "Youth" }, { id: "g1", groupName: "Choir" }] },
-      { keyName: "groupMembers", value: [{ groupId: "g1", personId: "p2" }, { groupId: "g1", personId: "p1" }, { groupId: "g2", personId: "p1" }] },
-      { keyName: "people", value: [{ id: "p1", displayName: "Ann" }, { id: "p2", displayName: "Bob" }] }
+      { keyName: "groupMembers", value: [{ groupId: "g1", personId: "p1" }, { groupId: "g1", personId: "p2" }, { groupId: "g2", personId: "p1" }] },
+      { keyName: "people", value: [{ id: "p1", displayName: "Ann", firstName: "Ann", lastName: "Zane" }, { id: "p2", displayName: "Bob", firstName: "Bob", lastName: "Adams" }] }
     ]
   });
 
@@ -56,8 +64,18 @@ describe("GroupAttendanceDownloadHelper.combine", () => {
     expect(annYouth["Sunday - 9:00 AM (2024-03-09)"]).toBe("absent");
   });
 
-  it("sorts rows by group, then name", () => {
+  it("labels a session with no service time by its date alone", () => {
+    const report: any = buildReport();
+    report.queries[0].value.push({ serviceName: null, serviceTimeName: null, serviceId: null, serviceTimeId: null, groupId: "g1", personId: "p2", sessionDate: "2024-03-20" });
+    const rows = GroupAttendanceDownloadHelper.combine(report);
+    const bob = rows.find((r: any) => r.displayName === "Bob" && r.groupName === "Choir");
+    expect(Object.keys(bob)).toContain("2024-03-20");
+    expect(bob["2024-03-20"]).toBe("present");
+    expect(Object.keys(bob).some((k) => k.includes("null"))).toBe(false);
+  });
+
+  it("sorts rows by group, then last name, first name", () => {
     const rows = GroupAttendanceDownloadHelper.combine(buildReport() as any);
-    expect(rows.map((r: any) => r.groupName + "/" + r.displayName)).toEqual(["Choir/Ann", "Choir/Bob", "Youth/Ann"]);
+    expect(rows.map((r: any) => r.groupName + "/" + r.displayName)).toEqual(["Choir/Bob", "Choir/Ann", "Youth/Ann"]);
   });
 });

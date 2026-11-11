@@ -18,6 +18,7 @@ export class Environment extends EnvironmentBase {
   static messagingApi: string;
   static doingApi: string;
   static storeApi: string;
+  static lessonsApi: string;
   static ministryStuffApi: string;
   static ministryStuffServiceKey: string;
   static ministryStuffContentRoot: string;
@@ -59,6 +60,7 @@ export class Environment extends EnvironmentBase {
 
   // Giving API specific
   static googleRecaptchaSecretKey: string;
+  static captchaEnforce: boolean = process.env.CAPTCHA_ENFORCE === "true";
 
   // AI provider configuration (shared across multiple modules)
   static aiProvider: string;
@@ -126,6 +128,9 @@ export class Environment extends EnvironmentBase {
     if (!process.env.GOCURRICULUM_CLIENT_SECRET) {
       process.env.GOCURRICULUM_CLIENT_SECRET = await AwsHelper.readParameter(`/${environment}/gocurriculumClientSecret`);
     }
+    if (!process.env.GOCURRICULUM_FEEDS) {
+      process.env.GOCURRICULUM_FEEDS = await AwsHelper.readParameter(`/${environment}/gocurriculumFeeds`);
+    }
     if (!process.env.GOOGLE_DRIVE_CLIENT_SECRET) {
       process.env.GOOGLE_DRIVE_CLIENT_SECRET = await AwsHelper.readParameter(`/${environment}/googleDriveClientSecret`);
     }
@@ -138,7 +143,7 @@ export class Environment extends EnvironmentBase {
     await this.initializeAppConfigs(data);
   }
 
-  private static isDevLikeEnvironment() {
+  static isDevLikeEnvironment() {
     return this.currentEnvironment === "dev" || this.currentEnvironment === "docker" || this.currentEnvironment === "local";
   }
 
@@ -149,6 +154,7 @@ export class Environment extends EnvironmentBase {
     if (environment === "docker") {
       if (!jwt || jwt === DOCKER_DEFAULT_JWT) console.warn("SECURITY WARNING: JWT_SECRET is unset or the public docker-compose default. Anyone can forge admin logins on this server. Set JWT_SECRET in .env to a long random value and restart.");
       if (!enc || enc === DOCKER_DEFAULT_ENCRYPTION) console.warn("SECURITY WARNING: ENCRYPTION_KEY is unset or the public docker-compose default, so stored payment/storage credentials are readable by anyone with the database. Set ENCRYPTION_KEY in .env (32 characters) before storing credentials; changing it later makes existing encrypted values unreadable.");
+      else if (enc.length !== 32) throw new Error(`ENCRYPTION_KEY must be exactly 32 characters (got ${enc.length}); aes-256-ctr cannot use it`);
       return;
     }
     if (environment === "dev" || environment === "local") return;
@@ -169,6 +175,7 @@ export class Environment extends EnvironmentBase {
     this.messagingApi = config.messagingApi || config.apiUrl + "/messaging";
     this.doingApi = config.doingApi || config.apiUrl + "/doing";
     this.storeApi = process.env.STORE_API_URL || config.storeApi || "";
+    this.lessonsApi = process.env.LESSONS_API_URL || config.lessonsApi || "";
     this.ministryStuffApi = process.env.MINISTRYSTUFF_API_URL || config.ministryStuffApi || "";
     this.ministryStuffServiceKey = process.env.MINISTRYSTUFF_SERVICE_KEY || "";
     this.ministryStuffContentRoot = process.env.MINISTRYSTUFF_CONTENT_ROOT || config.ministryStuffContentRoot || "";
@@ -184,7 +191,7 @@ export class Environment extends EnvironmentBase {
       try {
         const dbConfig = DatabaseUrlParser.parseConnectionString(process.env.DOING_MEMBERSHIP_CONNECTION_STRING);
         this.dbConnections.set("membership-doing", dbConfig);
-        console.log("✅ Loaded membership database config for doing module from DOING_MEMBERSHIP_CONNECTION_STRING");
+        console.debug("✅ Loaded membership database config for doing module from DOING_MEMBERSHIP_CONNECTION_STRING");
       } catch (error) {
         console.error(`❌ Failed to parse DOING_MEMBERSHIP_CONNECTION_STRING: ${error}`);
       }
@@ -202,7 +209,7 @@ export class Environment extends EnvironmentBase {
         try {
           const dbConfig = DatabaseUrlParser.parseConnectionString(connString);
           this.dbConnections.set(moduleName, dbConfig);
-          console.log(`✅ Loaded ${moduleName} database config from ${envVar}`);
+          console.debug(`✅ Loaded ${moduleName} database config from ${envVar}`);
           successfulConnections.push(moduleName);
         } catch (error) {
           console.error(`❌ Failed to parse ${moduleName} connection string from ${envVar}: ${error}`);
@@ -269,6 +276,7 @@ export class Environment extends EnvironmentBase {
     this.praiseChartsConsumerKey = process.env.PRAISECHARTS_CONSUMER_KEY || "";
     this.praiseChartsConsumerSecret = process.env.PRAISECHARTS_CONSUMER_SECRET || "";
     this.googleRecaptchaSecretKey = process.env.GOOGLE_RECAPTCHA_SECRET_KEY || "";
+    this.captchaEnforce = process.env.CAPTCHA_ENFORCE === "true";
     this.openRouterApiKey = process.env.OPENROUTER_API_KEY || "";
     this.openAiApiKey = process.env.OPENAI_API_KEY || "";
     this.webPushPublicKey = process.env.WEB_PUSH_PUBLIC_KEY || config.webPushPublicKey || "";
@@ -284,7 +292,7 @@ export class Environment extends EnvironmentBase {
     this.microsoftSsoClientSecret = process.env.MICROSOFT_SSO_CLIENT_SECRET || "";
     this.ssoAllowedOrigins = process.env.SSO_ALLOWED_ORIGINS || "";
 
-    console.log("✅ Configuration parameters loaded from environment variables");
+    console.debug("✅ Configuration parameters loaded from environment variables");
   }
 
   static get isMailConfigured(): boolean {

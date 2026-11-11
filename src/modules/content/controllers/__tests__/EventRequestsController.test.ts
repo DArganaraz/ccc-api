@@ -4,7 +4,7 @@ jest.mock("ics", () => ({ createEvents: jest.fn() }));
 jest.mock("../../helpers/index", () => ({
   CalendarHelper: { addExceptionDates: jest.fn() },
   HolidayHelper: { getHolidays: jest.fn() },
-  Permissions: { content: { edit: "contentEdit" } }
+  Permissions: { content: { edit: "contentEdit" }, calendars: { admin: "calendarsAdmin" } }
 }));
 jest.mock("../../helpers/ApprovalHelper", () => ({ ApprovalHelper: { determineStatus: jest.fn(() => "pending") } }));
 jest.mock("../../helpers/ConflictHelper", () => ({ ConflictHelper: { findConflicts: jest.fn() } }));
@@ -20,6 +20,7 @@ function makeController(opts: any = {}) {
     event: {
       load: jest.fn(async () => opts.event),
       loadRequestsForPerson: jest.fn(async () => opts.requests ?? []),
+      loadResolved: jest.fn(async () => opts.resolved ?? []),
       delete: jest.fn(async () => undefined)
     },
     eventBooking: {
@@ -89,5 +90,45 @@ describe("EventController.request hardening (M28)", () => {
     const saved = repos.event.save.mock.calls[0][0];
     expect(saved.groupId).toBeUndefined();
     expect(saved.title.length).toBe(255);
+  });
+});
+
+describe("EventController.getResolved (#1488)", () => {
+  it("returns decided event requests to calendar admins", async () => {
+    const { controller, repos } = makeController({ access: ["calendarsAdmin"], resolved: [{ id: "e2", approvalStatus: "approved" }] });
+    const result = await (controller as any).getResolved({}, {});
+    expect(repos.event.loadResolved).toHaveBeenCalledWith("c1");
+    expect(result).toEqual([{ id: "e2", approvalStatus: "approved" }]);
+  });
+
+  it("returns 401 without content edit or calendars admin", async () => {
+    const { controller, repos } = makeController({ access: [] });
+    const result = await (controller as any).getResolved({}, {});
+    expect(result.status).toBe(401);
+    expect(repos.event.loadResolved).not.toHaveBeenCalled();
+  });
+});
+
+describe("EventController.getRequestsForPerson (#1476)", () => {
+  it("returns a person's requests with their bookings to calendar admins", async () => {
+    const { controller, repos } = makeController({ access: ["calendarsAdmin"], requests: [{ id: "e1", title: "Retreat", requestedBy: "p7" }], bookings: [{ id: "b1", status: "approved", roomName: "Sanctuary" }] });
+    const result = await (controller as any).getRequestsForPerson("p7", {}, {});
+    expect(repos.event.loadRequestsForPerson).toHaveBeenCalledWith("c1", "p7");
+    expect(repos.eventBooking.loadForEvent).toHaveBeenCalledWith("c1", "e1");
+    expect(result).toEqual([{ id: "e1", title: "Retreat", requestedBy: "p7", bookings: [{ id: "b1", status: "approved", roomName: "Sanctuary" }] }]);
+  });
+
+  it("lets content editors see a person's requests", async () => {
+    const { controller, repos } = makeController({ access: ["contentEdit"], requests: [] });
+    const result = await (controller as any).getRequestsForPerson("p7", {}, {});
+    expect(repos.event.loadRequestsForPerson).toHaveBeenCalledWith("c1", "p7");
+    expect(result).toEqual([]);
+  });
+
+  it("returns 401 without content edit or calendars admin, even for someone else's id", async () => {
+    const { controller, repos } = makeController({ access: [], personId: "p1" });
+    const result = await (controller as any).getRequestsForPerson("p7", {}, {});
+    expect(result.status).toBe(401);
+    expect(repos.event.loadRequestsForPerson).not.toHaveBeenCalled();
   });
 });

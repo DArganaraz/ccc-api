@@ -5,14 +5,14 @@ jest.mock("@churchapps/apihelper", () => ({ UniqueIdHelper: { shortId: () => "ge
 import { getDb } from "../../db/index.js";
 import { CuratedEventRepo } from "../CuratedEventRepo.js";
 
-function recordingDb(rows: any[] = []) {
+function recordingDb() {
   const calls: { method: string; args: any[] }[] = [];
   const proxy: any = new Proxy(
     {},
     {
       get(_t, prop) {
         if (typeof prop === "symbol" || prop === "then") return undefined;
-        if (prop === "execute") return async () => rows;
+        if (prop === "execute") return async () => [];
         return (...args: any[]) => {
           calls.push({ method: prop as string, args });
           return proxy;
@@ -42,16 +42,17 @@ describe("CuratedEventRepo.loadForEvents (#1211)", () => {
   });
 });
 
-describe("CuratedEventRepo.loadForEvents duplicates", () => {
-  it("returns an event once when it is on the calendar through its group and on its own", async () => {
+describe("CuratedEventRepo.loadForEvents de-duplicates (#1337)", () => {
+  it("returns an event once when it is on the calendar on its own and through its group", async () => {
     const rows = [
-      { id: "ce_group", eventId: null, realEventId: "ev1", title: "Aged Care visit" },
-      { id: "ce_other", eventId: null, realEventId: "ev2", title: "Another" },
-      { id: "ce_own", eventId: "ev1", realEventId: "ev1", title: "Aged Care visit" }
+      { id: "single", eventId: "e1", curatedGroupId: "g1", realEventId: "e1", title: "Kids Night" },
+      { id: "group", eventId: null, curatedGroupId: "g1", realEventId: "e1", title: "Kids Night" },
+      { id: "group", eventId: null, curatedGroupId: "g1", realEventId: "e2", title: "Other" }
     ];
-    (getDb as jest.Mock).mockReturnValue(recordingDb(rows).proxy);
-    const result = await new CuratedEventRepo().loadForEvents("CAL1", "c1", true);
-    expect(result.map((r: any) => r.realEventId)).toEqual(["ev1", "ev2"]);
-    expect(result[0].id).toBe("ce_own");
+    const chain: any = new Proxy({}, { get: (_t, p) => (p === "then" ? undefined : p === "execute" ? async () => rows : () => chain) });
+    (getDb as jest.Mock).mockReturnValue(chain);
+    const result: any[] = await new CuratedEventRepo().loadForEvents("CAL1", "c1");
+    expect(result.map((r) => r.realEventId)).toEqual(["e1", "e2"]);
+    expect(result[0].id).toBe("group");
   });
 });

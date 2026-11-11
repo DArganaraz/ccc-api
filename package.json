@@ -22,7 +22,7 @@
     "build:migrations": "tsc -p tsconfig.migrations.json && copyfiles -u 0 tools/migrations/fingerprints.json dist/_migrations/",
     "migrate:fingerprints": "tsx tools/migration-fingerprints.ts",
     "build:playground": "cd src/playground && yarn exec tsc && copyfiles index.html dist/",
-    "build:prod": "yarn clean && (yarn exec tsc -p tsconfig.prod.json --noEmitOnError false || true) && yarn copy-assets && yarn build:migrations",
+    "build:prod": "yarn clean && yarn exec tsc -p tsconfig.prod.json && yarn copy-assets && yarn build:migrations",
     "build-layer": "rm -rf layer && mkdir -p layer/nodejs && node tools/build-layer-package.mjs && cp yarn.lock layer/nodejs/yarn.lock && cd layer/nodejs && yarn install",
     "rebuild-layer": "yarn clean-layer && yarn build-layer",
     "clean-layer": "rm -rf layer",
@@ -40,7 +40,8 @@
     "migrate:create": "tsx tools/migrate-create.ts",
     "scheduled-tasks": "tsx tools/run-scheduled-tasks.ts",
     "timer:30min": "tsx tools/run-timer-30min.ts",
-    "timer:midnight": "tsx tools/run-timer-midnight.ts"
+    "timer:midnight": "tsx tools/run-timer-midnight.ts",
+    "mcp:lessons-routes": "tsx tools/generate-lessons-routes.ts"
   },
   "keywords": [
     "church",
@@ -61,12 +62,12 @@
     "@aws-sdk/lib-storage": "^3.862.0",
     "@aws-sdk/s3-request-presigner": "3.1057.0",
     "@churchapps/apihelper": "^1.1.4",
-    "@churchapps/content-providers": "^0.13.0",
-    "@churchapps/helpers": "^2.7.1",
-    "@churchapps/texting": "^0.5.0",
+    "@churchapps/content-providers": "^0.16.1",
+    "@churchapps/helpers": "^2.15.2",
+    "@churchapps/texting": "^0.6.0",
     "@codegenie/serverless-express": "^4.15.0",
     "@hubspot/api-client": "^13.1.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@paypal/checkout-server-sdk": "^1.0.3",
     "axios": "^1.20.0",
     "bcryptjs": "^2.4.3",
@@ -106,7 +107,7 @@
     "@types/express-fileupload": "^1.5.1",
     "@types/jest": "^29.5.14",
     "@types/jsonwebtoken": "^9.0.7",
-    "@types/node": "^22.9.0",
+    "@types/node": "^24",
     "@types/web-push": "^3.6.4",
     "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.39.1",
@@ -126,7 +127,7 @@
     "typescript": "^5.7.2"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=24.0.0"
   },
   "packageManager": "yarn@4.15.0",
   "dependenciesMeta": {

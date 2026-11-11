@@ -9,6 +9,17 @@ const dailyLoop: ScheduleEntry = { id: "A", screenGroupId: "G", targetType: "pla
 const announcement: ScheduleEntry = { id: "B", screenGroupId: "G", targetType: "playlist", targetId: "P2", start: "2026-10-19T10:00:00", end: "2026-10-19T11:00:00", endBehavior: "fallback", enabled: true };
 const disabled: ScheduleEntry = { id: "C", screenGroupId: "G", targetType: "playlist", targetId: "P3", start: "2026-10-19T09:00:00", end: "2026-10-19T20:00:00", enabled: false };
 
+describe("ScreenScheduleHelper.playbackEndBehavior", () => {
+  it("sends teacher paced for a schedule saved as hold last", () => {
+    expect(ScreenScheduleHelper.playbackEndBehavior("holdLast")).toBe("teacherPaced");
+    expect(ScreenScheduleHelper.playbackEndBehavior("teacherPaced")).toBe("teacherPaced");
+    expect(ScreenScheduleHelper.playbackEndBehavior("loop")).toBe("loop");
+    expect(ScreenScheduleHelper.playbackEndBehavior("fallback")).toBe("fallback");
+    expect(ScreenScheduleHelper.playbackEndBehavior(undefined)).toBe("loop");
+    expect(ScreenScheduleHelper.playbackEndBehavior("")).toBe("loop");
+  });
+});
+
 describe("ScreenScheduleHelper.expand", () => {
   const now = new Date("2026-10-19T14:00:00Z");
 
@@ -62,5 +73,21 @@ describe("ScreenScheduleHelper item helpers", () => {
     expect(ScreenScheduleHelper.resolveType("googledrive")).toBe("url");
     expect(ScreenScheduleHelper.resolveType("onedrive")).toBe("url");
     expect(ScreenScheduleHelper.resolveType("lessonschurch")).toBe("url");
+  });
+});
+
+describe("ScreenScheduleHelper teacher paced entries", () => {
+  it("carries the teacher paced end behaviour onto its occurrences", () => {
+    const lesson: ScheduleEntry = { id: "L", screenGroupId: "G", targetType: "planType", targetId: "PL1", start: "2026-10-19T09:00:00", end: "2026-10-19T10:00:00", endBehavior: "teacherPaced", enabled: true };
+    const timeline = ScreenScheduleHelper.buildTimeline(ScreenScheduleHelper.expand([lesson], new Date("2026-10-19T13:30:00Z"), TZ));
+    expect(timeline.map((s) => [s.entry.endBehavior, s.start.toISOString(), s.end.toISOString()])).toEqual([["teacherPaced", "2026-10-19T14:00:00.000Z", "2026-10-19T15:00:00.000Z"]]);
+  });
+});
+
+describe("ScreenScheduleHelper.mediaTypeFromUrl extensionless video hosts (#1412)", () => {
+  it("treats lessons.church externalVideos and Mux URLs as video", () => {
+    expect(ScreenScheduleHelper.mediaTypeFromUrl("https://api.lessons.church/externalVideos/download/9DgTnt_fXPu")).toBe("video");
+    expect(ScreenScheduleHelper.mediaTypeFromUrl("https://stream.mux.com/abc123")).toBe("video");
+    expect(ScreenScheduleHelper.mediaTypeFromUrl("https://content.lessons.church/slide.jpg")).toBe("image");
   });
 });

@@ -4,7 +4,8 @@ const LEADING_ARTICLE = /^(the|a|an)\s+/;
 // "Chorus3" counts too: the heading word may run straight into its number
 // a bare "PRE" (or "Pre 2:") is how many charts shorten the pre-chorus; only alone, so "Precious" or "Pre-ordained" stay lyrics
 // "Repeat Chorus" / "REPEAT CHORUS 1" head a repeated section the same way "(Repeat Chorus)" does
-const STANZA_LABEL = /^(?:repeat\s+)?(verse|chorus|refrain|bridge|pre-?chorus|pre(?=\s*\d*\s*:?\s*$)|intro|outro|tag|ending|interlude|coda|instrumental|turnaround)(?=\b|\d)/i;
+// "intro(duction)?" matches both; the site's chordpro.ts already did, this rule had drifted out of sync with it
+const STANZA_LABEL = /^(?:repeat\s+)?(verse|chorus|refrain|bridge|pre-?chorus|pre(?=\s*\d*\s*:?\s*$)|intro(?:duction)?|outro|tag|ending|interlude|coda|instrumental|turnaround)(?=\b|\d)/i;
 const COMMENT_DIRECTIVE = /^\{\s*(?:c|ci|comment|comment_italic)\s*:\s*(.+?)\s*\}$/i;
 // "Verse 1:", "Verse 1," and "CHORUS: (2x)" name the same sections as "Verse 1" and "CHORUS (2x)"
 const tidyLabel = (label: string) => label.replace(/:(?=\s|$)|,\s*$/g, "").replace(/\s+/g, " ").trim();
@@ -53,7 +54,8 @@ export class DuplicateHelper {
   static firstLine(chordPro: string): string {
     for (const raw of (chordPro || "").split(/\r?\n/)) {
       // "(2x)" after a chord-only intro is a repeat mark, not the first line
-      const line = raw.replace(/\[[^\]]*\]/g, "").replace(/\(\s*(?:x\s*\d+|\d+\s*x)\s*\)/gi, "").trim();
+      // a repeat mark is not sung: "(x2)" anywhere, or a bare "x3" / "3x" ending the line
+      const line = raw.replace(/\[[^\]]*\]/g, "").replace(/\(\s*(?:x\s*\d+|\d+\s*x)\s*\)/gi, "").replace(/\s+(?:x\s*\d+|\d+\s*x)\s*$/i, "").trim();
       if (!line || line.startsWith("{") || sectionLabel(raw)) continue;
       // "Ooh, ooh" over the intro is sung but names nothing: the first line is the first one with words
       if (/^(?:(?:o+h*|a+h+|m+|hm+|la|na|yeah|whoa|woah)[\s,.!-]*)+$/i.test(line)) continue;

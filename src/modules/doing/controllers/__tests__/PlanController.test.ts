@@ -1,3 +1,4 @@
+jest.mock("../../helpers/AssignmentWorkflowHelper.js", () => ({ AssignmentWorkflowHelper: { workflowType: "assignmentConfirmation", issuePlan: jest.fn(), validateWorkflow: jest.fn() } }));
 import "reflect-metadata";
 
 jest.mock("../DoingBaseController", () => ({ DoingBaseController: class { json(obj: any, status: number) { return { obj, status }; } } }));
@@ -57,6 +58,14 @@ describe("PlanController.copy", () => {
     const body = { name: "Next Sunday", ministryId: "m1", serviceDate: "2026-09-27", notes: "New notes", signupDeadlineHours: 24, copyMode: "none", copyServiceOrder: true };
     await (makeController(repos) as any).copy("old", { body }, {});
     expect(repos.plan.save).toHaveBeenCalledWith(expect.objectContaining({ notes: "New notes", signupDeadlineHours: 24 }));
+  });
+
+  // Issue #1325: a deadline the user cleared stays cleared on the copy.
+  it("keeps a cleared signup deadline cleared instead of reviving the old one", async () => {
+    repos.plan.load = jest.fn(async () => ({ id: "old", serviceDate: new Date("2026-09-20"), signupDeadlineHours: 48 }));
+    const body = { name: "Next Sunday", ministryId: "m1", serviceDate: "2026-09-27", signupDeadlineHours: null, copyMode: "none" };
+    await (makeController(repos) as any).copy("old", { body }, {});
+    expect(repos.plan.save).toHaveBeenCalledWith(expect.objectContaining({ signupDeadlineHours: null }));
   });
 
   // Issue #1183: copying a plan should keep its volunteer settings too.
@@ -186,5 +195,24 @@ describe("PlanController.getSignupPlans", () => {
     expect(loadSetting).toHaveBeenCalledWith("c1", "volunteerSignupNextOnly");
     expect(result.map((r: any) => r.plan.id)).toEqual(["a1", "b1"]);
     expect(repos.position.loadByPlanIds).toHaveBeenCalledWith("c1", ["a1", "b1"]);
+  });
+});
+
+
+describe("PlanController confirmation workflow authorization", () => {
+  it("denies issuance before calling the workflow runtime", async () => {
+    const { AssignmentWorkflowHelper } = await import("../../helpers/AssignmentWorkflowHelper.js");
+    (PlanAuth.canEditPlan as jest.Mock).mockResolvedValueOnce(false);
+    const result = await (makeController({}) as any).issueRequests("otherPlan", { body: {} }, {});
+    expect(result).toEqual({ obj: {}, status: 401 });
+    expect(AssignmentWorkflowHelper.issuePlan).not.toHaveBeenCalled();
+  });
+  it("passes the authenticated church and scoped plan to issuance", async () => {
+    const { AssignmentWorkflowHelper } = await import("../../helpers/AssignmentWorkflowHelper.js");
+    (PlanAuth.canEditPlan as jest.Mock).mockResolvedValueOnce(true);
+    (AssignmentWorkflowHelper.issuePlan as jest.Mock).mockResolvedValueOnce({ issued: 1 });
+    const repos = {};
+    expect(await (makeController(repos) as any).issueRequests("plan1", { body: { churchId: "forged" } }, {})).toEqual({ issued: 1 });
+    expect(AssignmentWorkflowHelper.issuePlan).toHaveBeenCalledWith("c1", "plan1", repos);
   });
 });

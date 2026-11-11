@@ -4,7 +4,7 @@ const sendTransactional = jest.fn();
 const throttleAllow = jest.fn(async () => true);
 const throttleRecord = jest.fn(async () => {});
 jest.mock("../../helpers/index", () => ({
-  Permissions: { people: { edit: "peopleEdit", editSelf: "peopleEditSelf", view: "peopleView" }, server: { admin: "serverAdmin" } },
+  Permissions: { people: { edit: "peopleEdit", editSelf: "peopleEditSelf", view: "peopleView", viewNames: "peopleViewNames" }, attendance: { checkin: "attendanceCheckin" }, server: { admin: "serverAdmin" } },
   UserChurchHelper: { createForPersonEmailUpdate: jest.fn() },
   PersonHelper: { getPerson: jest.fn(), registerGuestHousehold: jest.fn() },
   Environment: { supportEmail: "support@test" },
@@ -45,14 +45,15 @@ function personController(opts: any = {}) {
         anniversary: r.anniversary
       }))
     },
-    groupMember: { isPublicGroupLeader: jest.fn(async () => opts.isPublicGroupLeader ?? false), loadForPeople: jest.fn(async () => []) },
+    groupMember: { isPublicGroupLeader: jest.fn(async () => opts.isPublicGroupLeader ?? false), loadForPeople: jest.fn(async () => []), loadForPerson: jest.fn(async () => []) },
     auditLog: { loadCount: jest.fn(async () => 0), create: jest.fn() },
     household: { deleteUnused: jest.fn(), save: jest.fn(async (h: any) => { h.id = "genH"; return h; }) },
     formSubmission: { convertAllToModel: (_c: string, rows: any[]) => rows, loadForContent: jest.fn(async () => []) },
     visibilityPreference: { loadForPerson: jest.fn(async () => null), loadForPeople: jest.fn(async () => []) },
     church: { loadById: jest.fn(async () => opts.church ?? { id: "c1" }) },
     setting: {
-      loadPublicSettings: jest.fn(async () => opts.settings ?? []),
+      loadPublicSettings: jest.fn(async () => (opts.settings ?? []).filter((r: any) => r.public !== 0)),
+      loadAll: jest.fn(async () => opts.settings ?? []),
       convertAllToModel: (_c: string, rows: any[]) => rows
     }
   };
@@ -220,7 +221,7 @@ describe("PersonController.guestRegister", () => {
   it("registers when the church enabled QR guest registration", async () => {
     const { controller } = personController({ settings: [{ keyName: "enableQRGuestRegistration", value: "true" }] });
     const result = await (controller as any).guestRegister({ body: guestBody, headers: {} }, {});
-    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", guestBody.members);
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", { members: guestBody.members }, undefined, false);
     expect(result).toEqual({ householdId: "h1", people: [] });
   });
 
@@ -228,7 +229,7 @@ describe("PersonController.guestRegister", () => {
     (PublicChurchContext.bind as jest.Mock).mockReturnValue({ churchId: "c1", mismatch: false });
     const { controller } = personController({ settings: [] });
     await (controller as any).guestRegister({ body: guestBody, headers: {} }, {});
-    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", guestBody.members);
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", { members: guestBody.members }, undefined, false);
   });
 
   it("rejects a claimed churchId that does not match the signed context", async () => {
@@ -237,6 +238,154 @@ describe("PersonController.guestRegister", () => {
     const result: any = await (controller as any).guestRegister({ body: guestBody, headers: {} }, {});
     expect(result.status).toBe(401);
     expect(PersonHelper.registerGuestHousehold).not.toHaveBeenCalled();
+  });
+});
+
+describe("PersonController.guestRegister profile fields", () => {
+  const enabled = { keyName: "enableQRGuestRegistration", value: "true" };
+  const fields = (modes: any) => ({ keyName: "guestRegistrationFields", value: JSON.stringify(modes) });
+  const register = (settings: any[], body: any) => {
+    const { controller } = personController({ settings });
+    return (controller as any).guestRegister({ body: { churchId: "c1", ...body }, headers: {} }, {});
+  };
+
+  beforeEach(() => {
+    (PublicChurchContext.bind as jest.Mock).mockReturnValue({ churchId: null, mismatch: false });
+    (PublicPersonRateLimiter.allow as jest.Mock).mockReturnValue(true);
+    (PersonHelper.registerGuestHousehold as jest.Mock).mockClear().mockResolvedValue({ householdId: "h1", people: [] });
+  });
+
+  it("passes included fields through and keeps email and phone on the primary contact", async () => {
+    const settings = [enabled, fields({ address: "required", birthDate: "optional", gender: "optional", maritalStatus: "optional", grade: "optional" })];
+    await register(settings, {
+      members: [
+        { firstName: " Pat ", lastName: "Visitor", email: "pat@example.com", phone: "555-0100", birthDate: "1990-04-02", gender: "Female" },
+        { firstName: "Sam", lastName: "Visitor", email: "kid@example.com", grade: "3" }
+      ],
+      address: { address1: "1 Main St", address2: "", city: "Springfield", state: "IL", zip: "62701" },
+      maritalStatus: "Married"
+    });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", {
+      members: [
+        { firstName: "Pat", lastName: "Visitor", email: "pat@example.com", phone: "555-0100", birthDate: "1990-04-02", gender: "Female" },
+        { firstName: "Sam", lastName: "Visitor", grade: "3" }
+      ],
+      address: { address1: "1 Main St", city: "Springfield", state: "IL", zip: "62701" },
+      maritalStatus: "Married"
+    }, undefined, false);
+  });
+
+  it("ignores a field the church turned off even when the client sends it", async () => {
+    await register([enabled, fields({ email: "off", phone: "off" })], {
+      members: [{ firstName: "Pat", lastName: "Visitor", email: "pat@example.com", phone: "555", birthDate: "1990-01-01", gender: "Male", grade: "5" }],
+      address: { address1: "1 Main St", city: "X", state: "IL", zip: "1" },
+      maritalStatus: "Single"
+    });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", { members: [{ firstName: "Pat", lastName: "Visitor" }] }, undefined, false);
+  });
+
+  it("rejects a missing required field", async () => {
+    const r1: any = await register([enabled, fields({ email: "required" })], { members: [{ firstName: "Pat", lastName: "Visitor" }] });
+    expect(r1.status).toBe(400);
+    const r2: any = await register([enabled, fields({ address: "required" })], { members: [{ firstName: "Pat", lastName: "Visitor" }], address: { address1: "1 Main St", city: "X", state: "IL" } });
+    expect(r2.status).toBe(400);
+    const r3: any = await register([enabled, fields({ grade: "required" })], { members: [{ firstName: "Pat", lastName: "Visitor", grade: "K" }, { firstName: "Sam", lastName: "Visitor" }] });
+    expect(r3.status).toBe(400);
+    expect(PersonHelper.registerGuestHousehold).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown gender, marital status or grade", async () => {
+    const settings = [enabled, fields({ gender: "optional", maritalStatus: "optional", grade: "optional" })];
+    expect((await register(settings, { members: [{ firstName: "Pat", lastName: "V", gender: "Other" }] })).status).toBe(400);
+    expect((await register(settings, { members: [{ firstName: "Pat", lastName: "V" }], maritalStatus: "Complicated" })).status).toBe(400);
+    expect((await register(settings, { members: [{ firstName: "Pat", lastName: "V", grade: "13" }] })).status).toBe(400);
+    expect(PersonHelper.registerGuestHousehold).not.toHaveBeenCalled();
+  });
+
+  it("passes each member's title through only when the church includes it, and enforces required", async () => {
+    await register([enabled, fields({ title: "optional" })], { members: [{ firstName: "Pat", lastName: "Visitor", title: " Dr " }, { firstName: "Sam", lastName: "Visitor", title: "" }] });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenLastCalledWith("c1", { members: [{ firstName: "Pat", lastName: "Visitor", title: "Dr" }, { firstName: "Sam", lastName: "Visitor" }] }, undefined, false);
+    await register([enabled], { members: [{ firstName: "Pat", lastName: "Visitor", title: "Dr" }] });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenLastCalledWith("c1", { members: [{ firstName: "Pat", lastName: "Visitor" }] }, undefined, false);
+    const r: any = await register([enabled, fields({ title: "required" })], { members: [{ firstName: "Pat", lastName: "Visitor" }] });
+    expect(r.status).toBe(400);
+  });
+
+  it("rejects a future, impossible or too-old birth date", async () => {
+    const settings = [enabled, fields({ birthDate: "optional" })];
+    const nextYear = new Date().getUTCFullYear() + 1;
+    for (const birthDate of [`${nextYear}-01-01`, "2001-02-30", "1800-01-01", "01/02/1990"]) {
+      const r: any = await register(settings, { members: [{ firstName: "Pat", lastName: "V", birthDate }] });
+      expect(r.status).toBe(400);
+    }
+    expect(PersonHelper.registerGuestHousehold).not.toHaveBeenCalled();
+  });
+});
+
+describe("PersonController.guestRegister group and comments", () => {
+  const enabled = { keyName: "enableQRGuestRegistration", value: "true" };
+  const register = (settings: any[], body: any) => {
+    const { controller } = personController({ settings });
+    return (controller as any).guestRegister({ body: { churchId: "c1", ...body }, headers: {} }, {});
+  };
+
+  beforeEach(() => {
+    (PublicChurchContext.bind as jest.Mock).mockReturnValue({ churchId: null, mismatch: false });
+    (PublicPersonRateLimiter.allow as jest.Mock).mockReturnValue(true);
+    (PersonHelper.registerGuestHousehold as jest.Mock).mockClear().mockResolvedValue({ householdId: "h1", people: [] });
+  });
+
+  it("passes the church's private guest group to the household save", async () => {
+    await register([enabled, { keyName: "guestRegistrationGroupId", value: "g1", public: 0 }], { members: [{ firstName: "Pat", lastName: "Visitor" }] });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", { members: [{ firstName: "Pat", lastName: "Visitor" }] }, "g1", false);
+  });
+
+  it("passes the church's private record-attendance switch along with the group", async () => {
+    await register([enabled, { keyName: "guestRegistrationGroupId", value: "g1", public: 0 }, { keyName: "guestRegistrationRecordAttendance", value: "true", public: 0 }], { members: [{ firstName: "Pat", lastName: "Visitor" }] });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", { members: [{ firstName: "Pat", lastName: "Visitor" }] }, "g1", true);
+  });
+
+  it("ignores a group the guest sends in the body", async () => {
+    await register([enabled], { members: [{ firstName: "Pat", lastName: "Visitor" }], groupId: "g-evil" });
+    expect(PersonHelper.registerGuestHousehold).toHaveBeenCalledWith("c1", { members: [{ firstName: "Pat", lastName: "Visitor" }] }, undefined, false);
+  });
+
+  it("keeps the comment only when the church included it, and enforces required", async () => {
+    const fields = (modes: any) => ({ keyName: "guestRegistrationFields", value: JSON.stringify(modes) });
+    await register([enabled], { members: [{ firstName: "Pat", lastName: "Visitor" }], comments: "Hi" });
+    expect((PersonHelper.registerGuestHousehold as jest.Mock).mock.calls[0][1].comments).toBeUndefined();
+    await register([enabled, fields({ comments: "optional" })], { members: [{ firstName: "Pat", lastName: "Visitor" }], comments: "  Loved the picnic  " });
+    expect((PersonHelper.registerGuestHousehold as jest.Mock).mock.calls[1][1].comments).toBe("Loved the picnic");
+    await register([enabled, fields({ comments: "optional" })], { members: [{ firstName: "Pat", lastName: "Visitor" }], comments: "x".repeat(1200) });
+    expect((PersonHelper.registerGuestHousehold as jest.Mock).mock.calls[2][1].comments).toHaveLength(1000);
+    const r: any = await register([enabled, fields({ comments: "required" })], { members: [{ firstName: "Pat", lastName: "Visitor" }] });
+    expect(r.status).toBe(400);
+  });
+});
+
+describe("PersonController.guestRegisterOptions", () => {
+  beforeEach(() => {
+    (PublicChurchContext.bind as jest.Mock).mockReturnValue({ churchId: null, mismatch: false });
+    (PublicPersonRateLimiter.allow as jest.Mock).mockReturnValue(true);
+  });
+
+  it("returns the defaults when the church has not set a checklist", async () => {
+    const { controller } = personController({ settings: [{ keyName: "enableQRGuestRegistration", value: "true" }] });
+    const result = await (controller as any).guestRegisterOptions({ query: { churchId: "c1" }, headers: {} }, {});
+    expect(result).toEqual({ title: "off", email: "optional", phone: "optional", householdRole: "optional", address: "off", birthDate: "off", gender: "off", maritalStatus: "off", grade: "off", comments: "off" });
+  });
+
+  it("returns the saved checklist and ignores unknown modes", async () => {
+    const settings = [{ keyName: "enableQRGuestRegistration", value: "true" }, { keyName: "guestRegistrationFields", value: JSON.stringify({ address: "required", grade: "optional", gender: "bogus" }) }];
+    const { controller } = personController({ settings });
+    const result: any = await (controller as any).guestRegisterOptions({ query: { churchId: "c1" }, headers: {} }, {});
+    expect(result).toMatchObject({ address: "required", grade: "optional", gender: "off" });
+  });
+
+  it("rejects when guest registration is not enabled", async () => {
+    const { controller } = personController({ settings: [] });
+    const result: any = await (controller as any).guestRegisterOptions({ query: { churchId: "c1" }, headers: {} }, {});
+    expect(result.status).toBe(401);
   });
 });
 
@@ -517,6 +666,13 @@ describe("PersonController directory visibility gate", () => {
     expect(repos.person.loadAlphabetical).not.toHaveBeenCalled();
   });
 
+  it("blocks a Staff-status person without People View when the church is set to Admins Only (#1316)", async () => {
+    const { controller, repos } = dirController({ membershipStatus: "Staff", directoryVisibility: "Staff" });
+    const result: any = await (controller as any).getList({ query: {} }, {});
+    expect(result.status).toBe(401);
+    expect(repos.person.loadAlphabetical).not.toHaveBeenCalled();
+  });
+
   it("still blocks a Member when the church is set to Staff only", async () => {
     const { controller, repos } = dirController({ membershipStatus: "Member", directoryVisibility: "Staff" });
     const result: any = await (controller as any).getList({ query: {} }, {});
@@ -526,8 +682,8 @@ describe("PersonController directory visibility gate", () => {
 });
 
 const nameRows = [
-  { id: "p1", displayName: "Ada Lovelace", photo: "a.png", birthDate: "1815-12-10", anniversary: "1835-01-01", contactInfo: { email: "ada@x.org", mobilePhone: "555" }, membershipStatus: "Visitor" },
-  { id: "p2", displayName: "Ben Clark", photo: "b.png", birthDate: "1980-02-02", contactInfo: { email: "ben@x.org" }, membershipStatus: "Member" }
+  { id: "p1", displayName: "Ada Lovelace", firstName: "Ada", lastName: "Lovelace", photo: "a.png", birthDate: "1815-12-10", anniversary: "1835-01-01", contactInfo: { email: "ada@x.org", mobilePhone: "555" }, membershipStatus: "Visitor" },
+  { id: "p2", displayName: "Ben Clark", firstName: "Ben", lastName: "Clark", photo: "b.png", birthDate: "1980-02-02", contactInfo: { email: "ben@x.org" }, membershipStatus: "Member" }
 ];
 
 describe("PersonController names lookup", () => {
@@ -537,8 +693,8 @@ describe("PersonController names lookup", () => {
     expect(repos.person.loadByIds).toHaveBeenCalledTimes(1);
     expect(repos.person.loadByIds).toHaveBeenCalledWith("c1", ["p1", "p2"]);
     expect(result).toEqual([
-      { id: "p1", name: { display: "Ada Lovelace" }, photo: "a.png" },
-      { id: "p2", name: { display: "Ben Clark" }, photo: "b.png" }
+      { id: "p1", name: { display: "Ada Lovelace", first: "Ada", last: "Lovelace" }, photo: "a.png" },
+      { id: "p2", name: { display: "Ben Clark", first: "Ben", last: "Clark" }, photo: "b.png" }
     ]);
     expect(JSON.stringify(result)).not.toMatch(/email|birthDate|anniversary|membershipStatus|mobilePhone|contactInfo/);
   });
@@ -548,8 +704,8 @@ describe("PersonController names lookup", () => {
     const result = await (controller as any).getNames({ query: { ids: "p1,p2" } }, {});
     expect(repos.person.loadByIds).toHaveBeenCalledWith("c1", ["p1", "p2"]);
     expect(result).toEqual([
-      { id: "p1", name: { display: "Ada Lovelace" }, photo: "a.png" },
-      { id: "p2", name: { display: "Ben Clark" }, photo: "b.png" }
+      { id: "p1", name: { display: "Ada Lovelace", first: "Ada", last: "Lovelace" }, photo: "a.png" },
+      { id: "p2", name: { display: "Ben Clark", first: "Ben", last: "Clark" }, photo: "b.png" }
     ]);
   });
 
@@ -572,5 +728,158 @@ describe("PersonController names lookup", () => {
     const result = await (controller as any).postNames({ body: { peopleIds: [] } }, {});
     expect(result).toEqual([]);
     expect(repos.person.loadByIds).not.toHaveBeenCalled();
+  });
+});
+
+describe("PersonController names-only search (View People Names Only)", () => {
+  const searchRows = [{ id: "p2", displayName: "Donald Clark", photo: "d.png", membershipStatus: "Visitor", birthDate: "1970-01-01", householdId: "h2", contactInfo: { email: "donald@x.org", mobilePhone: "555" } }];
+  function searchController(access: string[]) {
+    const { controller, repos } = personController({ access, membershipStatus: "Guest" });
+    repos.person.search = jest.fn(async () => searchRows);
+    repos.person.searchEmail = jest.fn(async () => searchRows);
+    repos.person.convertAllToBasicModel = jest.fn((_c: string, rows: any[]) => rows.map((r) => ({ id: r.id, name: { display: r.displayName }, contactInfo: {}, photo: r.photo, membershipStatus: r.membershipStatus })));
+    repos.person.convertAllToModelWithPermissions = jest.fn((_c: string, rows: any[]) => rows);
+    return { controller, repos };
+  }
+
+  it("GET /search returns only id, name, photo and status for a View Names role, with opted-out people filtered", async () => {
+    const { controller, repos } = searchController(["peopleViewNames"]);
+    const result: any = await (controller as any).search({ query: { term: "Donald" } }, {});
+    expect(repos.person.search).toHaveBeenCalledWith("c1", "Donald", true);
+    expect(result).toEqual([{ id: "p2", name: { display: "Donald Clark" }, contactInfo: {}, photo: "d.png", membershipStatus: "Visitor" }]);
+    expect(JSON.stringify(result)).not.toMatch(/donald@x.org|birthDate|householdId|mobilePhone/);
+    expect(repos.person.convertAllToModelWithPermissions).not.toHaveBeenCalled();
+  });
+
+  it("POST /search returns the same names-only result for a View Names role", async () => {
+    const { controller, repos } = searchController(["peopleViewNames"]);
+    const result: any = await (controller as any).searchPost({ body: { term: "Donald" } }, {});
+    expect(repos.person.search).toHaveBeenCalledWith("c1", "Donald", true);
+    expect(result).toEqual([{ id: "p2", name: { display: "Donald Clark" }, contactInfo: {}, photo: "d.png", membershipStatus: "Visitor" }]);
+  });
+
+  it("does not allow email lookups with View Names only", async () => {
+    const { controller, repos } = searchController(["peopleViewNames"]);
+    const result: any = await (controller as any).searchPost({ body: { email: "donald@x.org" } }, {});
+    expect(result).toEqual([]);
+    expect(repos.person.searchEmail).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 from both search endpoints with neither View People nor View Names", async () => {
+    const { controller, repos } = searchController([]);
+    const getResult: any = await (controller as any).search({ query: { term: "Donald" } }, {});
+    const postResult: any = await (controller as any).searchPost({ body: { term: "Donald" } }, {});
+    expect(getResult.status).toBe(401);
+    expect(postResult.status).toBe(401);
+    expect(repos.person.search).not.toHaveBeenCalled();
+  });
+
+  it("returns a visitor for a Member with View Names, because directory access would hide them", async () => {
+    const { controller, repos } = personController({ access: ["peopleViewNames"], membershipStatus: "Member" });
+    repos.person.search = jest.fn(async () => searchRows);
+    repos.person.convertAllToBasicModel = jest.fn((_c: string, rows: any[]) => rows.map((r) => ({ id: r.id, name: { display: r.displayName }, contactInfo: {}, photo: r.photo, membershipStatus: r.membershipStatus })));
+    repos.person.convertAllToModelWithPermissions = jest.fn((_c: string, rows: any[]) => rows);
+    const result: any = await (controller as any).searchPost({ body: { term: "Donald" } }, {});
+    expect(repos.person.convertAllToBasicModel).toHaveBeenCalled();
+    expect(repos.person.convertAllToModelWithPermissions).not.toHaveBeenCalled();
+    expect(result).toEqual([{ id: "p2", name: { display: "Donald Clark" }, contactInfo: {}, photo: "d.png", membershipStatus: "Visitor" }]);
+  });
+
+  it("keeps the full View People result unchanged", async () => {
+    const { controller, repos } = searchController(["peopleView"]);
+    const result: any = await (controller as any).searchPost({ body: { term: "Donald" } }, {});
+    expect(repos.person.convertAllToModelWithPermissions).toHaveBeenCalled();
+    expect(repos.person.convertAllToBasicModel).not.toHaveBeenCalled();
+    expect(result[0].contactInfo.email).toBe("donald@x.org");
+  });
+
+  it("GET /recent returns the names-only recent list for a View Names role", async () => {
+    const { controller, repos } = searchController(["peopleViewNames"]);
+    repos.person.loadRecent = jest.fn(async () => searchRows);
+    const result: any = await (controller as any).getRecent({ query: {} }, {});
+    expect(repos.person.loadRecent).toHaveBeenCalledWith("c1", true);
+    expect(result).toEqual([{ id: "p2", name: { display: "Donald Clark" }, contactInfo: {}, photo: "d.png", membershipStatus: "Visitor" }]);
+    expect(repos.person.convertAllToModelWithPermissions).not.toHaveBeenCalled();
+  });
+
+  it("GET /recent returns 401 with neither View People nor View Names", async () => {
+    const { controller, repos } = searchController([]);
+    repos.person.loadRecent = jest.fn(async () => searchRows);
+    const result: any = await (controller as any).getRecent({ query: {} }, {});
+    expect(result.status).toBe(401);
+    expect(repos.person.loadRecent).not.toHaveBeenCalled();
+  });
+});
+
+describe("PersonController /ids names-only (issue 1308)", () => {
+  const rows = [
+    { id: "visitor", displayName: "Zacchaeus Attendance", photo: "z.png", membershipStatus: "Visitor", optedOut: false, contactInfo: { email: "z@x.org" }, birthDate: "1990-01-01" },
+    { id: "hidden", displayName: "Opted Out", photo: "o.png", membershipStatus: "Member", optedOut: true, contactInfo: { email: "o@x.org" } }
+  ];
+
+  function idsController(access: string[], membershipStatus = "Member") {
+    const { controller, repos } = personController({ access, membershipStatus, rowsByIds: rows, personId: "me" });
+    repos.person.convertAllToBasicModel = jest.fn((_c: string, list: any[]) => list.map((r) => ({ id: r.id, name: { display: r.displayName }, photo: r.photo })));
+    repos.person.convertAllToModelWithPermissions = jest.fn((_c: string, list: any[]) => list);
+    return { controller, repos };
+  }
+
+  it("returns id, name and photo for View Names, keeps visitors, and drops opted-out people", async () => {
+    const { controller, repos } = idsController(["peopleViewNames"], "Member");
+    const result: any = await (controller as any).getMultiple({ query: { ids: "visitor,hidden" } }, {});
+    const passed = (repos.person.convertAllToBasicModel as jest.Mock).mock.calls[0][1];
+    expect(passed.map((p: any) => p.id)).toEqual(["visitor"]);
+    expect(repos.person.convertAllToModelWithPermissions).not.toHaveBeenCalled();
+    expect(result).toEqual([{ id: "visitor", name: { display: "Zacchaeus Attendance" }, photo: "z.png" }]);
+    expect(JSON.stringify(result)).not.toMatch(/email|birthDate|contactInfo|z@x.org/);
+  });
+
+  it("returns 401 with neither View People, View Names, nor directory access and does not load people", async () => {
+    const { controller, repos } = idsController([], "Guest");
+    const result: any = await (controller as any).getMultiple({ query: { ids: "visitor" } }, {});
+    expect(result.status).toBe(401);
+    expect(repos.person.loadByIds).not.toHaveBeenCalled();
+  });
+
+  it("keeps the full model for View People", async () => {
+    const { controller, repos } = idsController(["peopleView"], "Guest");
+    const result: any = await (controller as any).getMultiple({ query: { ids: "visitor,hidden" } }, {});
+    expect(repos.person.convertAllToModelWithPermissions).toHaveBeenCalled();
+    expect(repos.person.convertAllToBasicModel).not.toHaveBeenCalled();
+    expect(result[0].contactInfo.email).toBe("z@x.org");
+  });
+});
+
+// ChurchAppsSupport#1448: with no Directory Approval Group a member's Add Family Member saves straight to their household.
+describe("PersonController.addFamilyMember", () => {
+  const body = { first: "Sam", last: "Clark", prefix: "Mr", mobilePhone: "555-0102", householdRole: "Child" };
+
+  it("creates the person in the caller's household with the role, title and phone", async () => {
+    const { controller, repos } = personController({ access: ["peopleEditSelf"], person: { id: "p1", householdId: "h9", name: { last: "Clark" } }, settings: [] });
+    const result: any = await (controller as any).addFamilyMember({ body }, {});
+    expect(repos.person.save).toHaveBeenCalledTimes(1);
+    expect(repos.person.save.mock.calls[0][0]).toMatchObject({ churchId: "c1", householdId: "h9", householdRole: "Child", name: { first: "Sam", last: "Clark", prefix: "Mr" }, contactInfo: { mobilePhone: "555-0102" } });
+    expect(result.id).toBe("genP");
+  });
+
+  it("falls back to Other and the caller's last name", async () => {
+    const { controller, repos } = personController({ access: ["peopleEditSelf"], person: { id: "p1", householdId: "h9", name: { last: "Clark" } }, settings: [] });
+    await (controller as any).addFamilyMember({ body: { first: "Sam", householdRole: "Boss" } }, {});
+    expect(repos.person.save.mock.calls[0][0]).toMatchObject({ householdRole: "Other", name: { first: "Sam", last: "Clark" } });
+  });
+
+  it("refuses when the church reviews directory changes", async () => {
+    const { controller, repos } = personController({ access: ["peopleEditSelf"], person: { id: "p1", householdId: "h9", name: {} }, settings: [{ keyName: "directoryApprovalGroupId", value: "g1" }] });
+    const result: any = await (controller as any).addFamilyMember({ body }, {});
+    expect(result.status).toBe(403);
+    expect(repos.person.save).not.toHaveBeenCalled();
+  });
+
+  it("refuses a caller without editSelf, and a missing first name", async () => {
+    const denied = personController({ access: [], person: { id: "p1", householdId: "h9", name: {} }, settings: [] });
+    expect((await (denied.controller as any).addFamilyMember({ body }, {})).status).toBe(401);
+    const blank = personController({ access: ["peopleEditSelf"], person: { id: "p1", householdId: "h9", name: {} }, settings: [] });
+    expect((await (blank.controller as any).addFamilyMember({ body: { first: " " } }, {})).status).toBe(400);
+    expect(blank.repos.person.save).not.toHaveBeenCalled();
   });
 });

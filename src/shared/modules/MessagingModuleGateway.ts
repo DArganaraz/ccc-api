@@ -1,6 +1,8 @@
 import { RepoManager } from "../infrastructure/RepoManager.js";
 import { MergeFieldHelper } from "../../modules/messaging/helpers/MergeFieldHelper.js";
+import { PreferenceGateHelper } from "../../modules/messaging/helpers/PreferenceGateHelper.js";
 import { NotificationHelper } from "../../modules/messaging/helpers/NotificationHelper.js";
+import { ChurchEmailLimiter } from "../helpers/ChurchEmailLimiter.js";
 
 interface EmailRecipient {
   firstName?: string;
@@ -23,13 +25,18 @@ export interface MessagingModuleGateway {
   loadDeliveryLogsByPerson(churchId: string, personId: string): Promise<any[]>;
   // Person notes are conversations; the caller passes the contentTypes it is allowed to read.
   loadPersonNotes(churchId: string, personId: string, contentTypes: string[]): Promise<any[]>;
+  loadConversation(churchId: string, id: string): Promise<any | null>;
+  // Starts a person's hidden Notes conversation with one message; returns the conversation id.
+  createPersonNote(churchId: string, personId: string, title: string, text: string): Promise<string>;
   createNotifications(notifications: any[]): Promise<any[]>;
   // Render a saved EmailTemplate and send through notification funnel; returns false if template missing or no email.
-  sendTemplatedEmail(churchId: string, personId: string, templateId: string, recipient: EmailRecipient, churchName: string, subjectOverride?: string): Promise<boolean>;
+  // extras fills the gift merge fields ({{amount}}, {{giftDate}}, {{fund}}, {{receipt}}) for donation-started workflows.
+  sendTemplatedEmail(churchId: string, personId: string, templateId: string, recipient: EmailRecipient, churchName: string, subjectOverride?: string, extras?: Record<string, string>): Promise<boolean>;
+  sendServingWorkflowMessage(churchId: string, personId: string, taskId: string, channel: "email" | "sms", person: { email?: string; mobilePhone?: string; optedOut?: boolean | number; firstName?: string; lastName?: string; displayName?: string }, message: { subject: string; html: string; text: string }, churchName: string): Promise<string>;
   // Ad-hoc bulk SMS (pre-filtered recipients, capped at 500); returns { ok: false, reason: "no_provider" } if no provider.
   sendBulkText(churchId: string, recipients: BulkTextRecipient[], message: string, context?: string): Promise<BulkTextResult>;
   // Automated SMS to one person with merge fields resolved (caller checks opt-out); returns { ok: false, reason } on no_provider, insufficient_credits or provider error.
-  sendPersonText(churchId: string, personId: string, recipient: TextRecipient, message: string, churchName: string): Promise<{ ok: boolean; reason?: string }>;
+  sendPersonText(churchId: string, personId: string, recipient: TextRecipient, message: string, churchName: string, extras?: Record<string, string>): Promise<{ ok: boolean; reason?: string }>;
 }
 
 interface TextRecipient {
@@ -105,20 +112,35 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
     return Promise.all(conversations.map(async (c: any) => ({ ...c, messages: await repos.message.loadForConversation(churchId, c.id) })));
   }
 
+  public async loadConversation(churchId: string, id: string) {
+    return (await this.repos()).conversation.loadById(churchId, id);
+  }
+
+  public async createPersonNote(churchId: string, personId: string, title: string, text: string) {
+    const repos = await this.repos();
+    const conversation = await repos.conversation.save({ churchId, contentType: "person", contentId: personId, title, dateCreated: new Date(), visibility: "hidden", allowAnonymousPosts: false });
+    await repos.message.save({ churchId, conversationId: conversation.id, displayName: "Guest sign-up", timeSent: new Date(), content: text, messageType: "comment" });
+    await repos.conversation.updateStats(conversation.id);
+    return conversation.id as string;
+  }
+
   public async createNotifications(notifications: any[]) {
     const repos = await this.repos();
     return Promise.all(notifications.map((n) => repos.notification.save(n)));
   }
 
-  public async sendTemplatedEmail(churchId: string, personId: string, templateId: string, recipient: EmailRecipient, churchName: string, subjectOverride?: string): Promise<boolean> {
+  public async sendTemplatedEmail(churchId: string, personId: string, templateId: string, recipient: EmailRecipient, churchName: string, subjectOverride?: string, extras?: Record<string, string>): Promise<boolean> {
     if (!recipient?.email) return false;
     const repos = await this.repos();
     const template = await repos.emailTemplate.loadById(churchId, templateId);
     if (!template) return false;
+    // An unapproved or paused church has no allowance and the send is dropped downstream; report it as not sent.
+    if ((await ChurchEmailLimiter.remaining(churchId)) < 1) return false;
     const church = { name: churchName };
-    const subject = MergeFieldHelper.resolve(subjectOverride || template.subject || "", recipient, church);
-    const body = MergeFieldHelper.resolve(template.htmlContent || "", recipient, church);
-    await NotificationHelper.createNotifications([personId], churchId, "task", templateId, subject, undefined, undefined, {
+    // The receipt table belongs in the body; a subject only gets the plain fields.
+    const subject = MergeFieldHelper.resolve(subjectOverride || template.subject || "", recipient, church, { ...extras, receipt: "" });
+    const body = MergeFieldHelper.resolve(template.htmlContent || "", recipient, church, extras);
+    await NotificationHelper.createNotifications([personId], churchId, "email", templateId, subject, undefined, undefined, {
       category: "announcements",
       deliveryStartLevel: 2,
       emailImmediate: true,
@@ -126,6 +148,23 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
       emailByPerson: { [personId]: { subject, html: body } }
     });
     return true;
+  }
+
+  // Direct workflow attempt: never queues an unread-email escalation which could
+  // outlive the request. The card records blocked/skipped/uncertain outcomes.
+  public async sendServingWorkflowMessage(churchId: string, personId: string, taskId: string, channel: "email" | "sms", person: { email?: string; mobilePhone?: string; optedOut?: boolean | number; firstName?: string; lastName?: string; displayName?: string }, message: { subject: string; html: string; text: string }, churchName: string): Promise<string> {
+    const repos = await this.repos();
+    const pref = await repos.notificationPreference.loadByPersonId(churchId, personId);
+    const overrides = await repos.notificationPreferenceOverride.loadForPerson(churchId, personId);
+    const gate = PreferenceGateHelper.evaluate(churchId, personId, "serving_schedule", channel, { pref, overrides });
+    if (!gate.allow) return `skipped (${gate.reason || gate.decision})`;
+    if (channel === "sms") {
+      if (person.optedOut || !person.mobilePhone?.trim()) return "skipped (opted out or no mobile phone)";
+      const result = await this.sendPersonText(churchId, personId, { ...person, phoneNumber: person.mobilePhone.trim() }, message.text, churchName);
+      return result.ok ? "sent" : `blocked (${result.reason || "provider failure"})`;
+    }
+    if (!person.email) return "skipped (no email)";
+    return NotificationHelper.sendWorkflowEmail(churchId, personId, taskId, person.email, message.subject, message.html);
   }
 
   public async sendBulkText(churchId: string, recipients: BulkTextRecipient[], message: string, _context?: string): Promise<BulkTextResult> {
@@ -172,9 +211,9 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
     return { ok: true, sent: successCount, failed: failCount };
   }
 
-  public async sendPersonText(churchId: string, personId: string, recipient: TextRecipient, template: string, churchName: string): Promise<{ ok: boolean; reason?: string }> {
+  public async sendPersonText(churchId: string, personId: string, recipient: TextRecipient, template: string, churchName: string, extras?: Record<string, string>): Promise<{ ok: boolean; reason?: string }> {
     const phoneNumber = recipient.phoneNumber;
-    const message = MergeFieldHelper.resolve(template, recipient, { name: churchName }).slice(0, 1600);
+    const message = MergeFieldHelper.resolve(template, recipient, { name: churchName }, extras).slice(0, 1600);
     const repos = await this.repos();
     const config = await this.getTextingConfig(repos, churchId);
     if (!config) return { ok: false, reason: "no_provider" };

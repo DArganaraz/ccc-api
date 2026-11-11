@@ -5,6 +5,7 @@ import { Donation } from "../models/index.js";
 import { Permissions } from "../../../shared/helpers/Permissions.js";
 import { GatewayService } from "../../../shared/helpers/GatewayService.js";
 import { ExchangeRateHelper } from "../../../shared/helpers/ExchangeRateHelper.js";
+import { BatchAccessHelper } from "../helpers/BatchAccessHelper.js";
 
 @controller("/giving/donations")
 export class DonationController extends GivingBaseController {
@@ -135,7 +136,14 @@ export class DonationController extends GivingBaseController {
         let result;
         if (canView && req.query.batchId !== undefined) result = await this.repos.donation.loadByBatchId(au.churchId, req.query.batchId.toString());
         else if (personId) result = await this.repos.donation.loadByPersonId(au.churchId, personId, canView && req.query.includeNonDeductible === "1");
-        else result = await this.repos.donation.loadAll(au.churchId);
+        else if (req.query.startDate !== undefined || req.query.endDate !== undefined) {
+          // A church's full history can pass Lambda's 6MB response limit; giving statements ask for one year.
+          const startDate = req.query.startDate?.toString() ?? "";
+          const endDate = req.query.endDate?.toString() ?? "";
+          const isDay = (d: string) => /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(new Date(d).getTime());
+          if (!isDay(startDate) || !isDay(endDate)) return this.json({ error: "startDate and endDate must be YYYY-MM-DD" }, 400);
+          result = await this.repos.donation.loadByDateRange(au.churchId, startDate, endDate);
+        } else result = await this.repos.donation.loadAll(au.churchId);
         return this.repos.donation.convertAllToModel(au.churchId, result as any[] as any[]);
       }
     });
@@ -144,23 +152,31 @@ export class DonationController extends GivingBaseController {
   @httpPost("/")
   public async save(req: express.Request<{}, {}, Donation[]>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      if (!au.checkAccess(Permissions.donations.edit)) return this.json({}, 401);
-      else {
-        const promises: Promise<Donation>[] = [];
-        req.body.forEach((donation) => {
-          donation.churchId = au.churchId;
-          promises.push(this.repos.donation.save(donation));
-        });
-        const result = await Promise.all(promises);
-        return this.repos.donation.convertAllToModel(au.churchId, result as any[] as any[]);
+      if (!BatchAccessHelper.canEnter(au)) return this.json({}, 401);
+      for (const donation of req.body) {
+        if (!(await BatchAccessHelper.canChangeDonation(this.repos, au, donation))) return this.json({ error: "This batch is closed." }, 403);
       }
+      const promises: Promise<Donation>[] = [];
+      req.body.forEach((donation) => {
+        donation.churchId = au.churchId;
+        // Stamped here, never from the client, and left alone on edits (including people merges).
+        if (!donation.id) donation.enteredBy = au.personId;
+        else delete donation.enteredBy;
+        // New gifts may carry their fund rows so they exist before donation.created fires; only new rows, never ids.
+        const fundDonations = donation.id ? undefined : (donation.fundDonations || []).map((fd) => ({ fundId: fd.fundId, amount: fd.amount }));
+        delete donation.fundDonations;
+        promises.push(this.repos.donation.save(donation, fundDonations));
+      });
+      const result = await Promise.all(promises);
+      return this.repos.donation.convertAllToModel(au.churchId, result as any[] as any[]);
     });
   }
 
   @httpDelete("/:id")
   public async delete(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      if (!au.checkAccess(Permissions.donations.edit)) return this.json({}, 401);
+      if (!BatchAccessHelper.canEnter(au)) return this.json({}, 401);
+      else if (!(await BatchAccessHelper.canDeleteDonation(this.repos, au, id))) return this.json({ error: "This batch is closed." }, 403);
       else {
         await this.repos.donation.delete(au.churchId, id);
         return this.json({});

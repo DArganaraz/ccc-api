@@ -9,7 +9,7 @@ import { MembershipBaseController } from "./MembershipBaseController.js";
 import { AuthGuidHelper, UserHelper, UserChurchHelper, UniqueIdHelper, Environment, Permissions, AuditLogHelper, LoginRateLimiter, MauticHelper, ChurchHelper, PublicPersonRateLimiter } from "../helpers/index.js";
 import { ArrayHelper } from "@churchapps/apihelper";
 import { TransactionalEmailHelper } from "../../../shared/helpers/TransactionalEmailHelper.js";
-import { ChurchEmailLimiter } from "../../../shared/helpers/ChurchEmailLimiter.js";
+import { MfaHelper } from "../helpers/MfaHelper.js";
 
 const emailPasswordValidation = [
   body("email").isEmail().trim().normalizeEmail({ gmail_remove_dots: false }).withMessage("enter a valid email address"),
@@ -76,20 +76,26 @@ export class UserController extends MembershipBaseController {
         const ip = AuditLogHelper.getClientIp(req);
         // A jwt refresh is already-proven identity, so it is not a credential guess and is not throttled.
         const isJwtRefresh = req.body.jwt !== undefined && req.body.jwt !== "";
+        const isMfaStep = !isJwtRefresh && !!req.body.mfaToken;
+        const mfaUserId = isMfaStep ? MfaHelper.verifyLoginToken(req.body.mfaToken) : null;
         const rateLimitIp = LoginRateLimiter.getClientIp(req);
-        const account = loginAccountKey(req.body);
-        if (!isJwtRefresh && !(await LoginRateLimiter.allow(this.repos, rateLimitIp, account))) {
+        const account = isMfaStep ? "mfa:" + (mfaUserId || "invalid") : loginAccountKey(req.body);
+        const accountMax = isMfaStep ? LoginRateLimiter.maxPerAccountStrict : LoginRateLimiter.maxPerAccount;
+        if (!isJwtRefresh && !(await LoginRateLimiter.allow(this.repos, rateLimitIp, account, accountMax))) {
           return this.json({ errors: ["Too many requests"] }, 429);
         }
 
         let user: User = null;
         if (isJwtRefresh) {
           user = await AuthenticatedUser.loadUserByJwt(req.body.jwt, this.repos);
+        } else if (isMfaStep) {
+          if (mfaUserId && (await MfaHelper.verifyCode(this.repos, mfaUserId, req.body.mfaCode))) user = await this.repos.user.load(mfaUserId);
         } else if (req.body.authGuid !== undefined && req.body.authGuid !== "") {
           user = await this.repos.user.loadByAuthGuid(req.body.authGuid);
           if (user !== null) user = await this.consumeLoginGuid(user, req.body.authGuid);
         } else {
-          const found = await this.repos.user.loadByEmail(req.body.email.trim());
+          const email = typeof req.body.email === "string" ? req.body.email.trim() : "";
+          const found = email ? await this.repos.user.loadByEmail(email) : null;
           // Always run exactly one compare, even when the email is unknown, so the two failures cost the same.
           const passwordMatched = bcrypt.compareSync(req.body.password || "", found?.password?.toString() || TIMING_EQUALIZER_HASH);
           user = found !== null && passwordMatched ? found : null;
@@ -97,9 +103,12 @@ export class UserController extends MembershipBaseController {
 
         if (user === null) {
           if (!isJwtRefresh) await LoginRateLimiter.recordFailure(this.repos, rateLimitIp, account);
-          const failEmail = req.body.email || req.body.authGuid || "(jwt)";
-          AuditLogHelper.logLogin(this.repos, "", "", false, ip, { email: failEmail, reason: "Invalid Credentials" });
-          return this.denyAccess(["Login failed"]);
+          const failEmail = req.body.email || req.body.authGuid || (isMfaStep ? "(2fa)" : "(jwt)");
+          AuditLogHelper.logLogin(this.repos, "", mfaUserId || "", false, ip, { email: failEmail, reason: isMfaStep ? "Invalid two-factor code" : "Invalid Credentials" });
+          return this.denyAccess([isMfaStep ? "Invalid code" : "Login failed"]);
+        } else if (!isJwtRefresh && !isMfaStep && (await this.repos.userMfa.isEnabled(user.id))) {
+          await LoginRateLimiter.clearFailures(this.repos, account, rateLimitIp);
+          return this.json({ mfaRequired: true, mfaToken: MfaHelper.createLoginToken(user.id) }, 200);
         } else {
           const userChurches = await this.getUserChurches(user.id);
 
@@ -298,9 +307,9 @@ export class UserController extends MembershipBaseController {
       if (!(await PublicPersonRateLimiter.allow(this.repos, LoginRateLimiter.getClientIp(req), "", "register", REGISTER_MAX_PER_IP, 60 * 60))) return this.json({ errors: ["Too many requests"] }, 429);
 
       const register: RegisterUserRequest = req.body;
-      // Bot traps fake success so bots don't adapt; both fields are optional so older clients (B1Mobile) still register.
-      if (register.website || (typeof register.fillMs === "number" && register.fillMs < REGISTER_MIN_FILL_MS)) {
-        console.log("Register: bot rejected", register.email, register.website ? "honeypot" : "fillMs=" + register.fillMs);
+      // Fake success so bots don't adapt; fillMs is optional so older clients (B1Mobile) still register. No honeypot: browser autofill filled it for real people.
+      if (typeof register.fillMs === "number" && register.fillMs < REGISTER_MIN_FILL_MS) {
+        console.log("Register: bot rejected", register.email, "fillMs=" + register.fillMs);
         return this.json({ email: register.email, firstName: register.firstName, lastName: register.lastName, mailConfigured: true }, 200);
       }
       let user: User = await this.repos.user.loadByEmail(register.email);
@@ -370,7 +379,8 @@ export class UserController extends MembershipBaseController {
         // Add first user to server admins group
         if (userCount === 0) {
           const roles = await this.repos.role.loadAll();
-          if (roles.length > 0) await this.repos.roleMember.save({ roleId: roles[0].id, userId: user.id, addedBy: user.id });
+          const serverAdmins = roles.find((r: any) => r.churchId === "0" && r.name === "Server Admins");
+          if (serverAdmins) await this.repos.roleMember.save({ roleId: serverAdmins.id, userId: user.id, addedBy: user.id });
         }
         console.log("Register: total", Date.now() - regStart, "ms");
       }
@@ -647,6 +657,7 @@ export class UserController extends MembershipBaseController {
         lastName: user.lastName,
         registrationDate: user.registrationDate,
         lastLogin: user.lastLogin,
+        mfaEnabled: await this.repos.userMfa.isEnabled(user.id),
         churches
       }, 200);
     });
@@ -675,8 +686,7 @@ export class UserController extends MembershipBaseController {
       // Only invite people already in this church; otherwise this is an open relay from our SES identity.
       const matches = await this.repos.person.searchEmail(au.churchId, email);
       if (!matches.some((p: Person) => (p.email || "").toLowerCase() === email.toLowerCase())) return res.status(400).json({ errors: ["No person in this church has that email"] });
-      const reserved = await ChurchEmailLimiter.reserve(au.churchId, "invite", [{ address: email }]);
-      if (!reserved) return this.json({ errors: ["Daily email limit reached"] }, 429);
+      // Fixed template (church name and role only). Not church-written mail, so it skips ChurchEmailLimiter.
       const church = await this.repos.church.loadById(au.churchId);
 
       const inviterEmail = au.email || undefined;
@@ -696,14 +706,7 @@ export class UserController extends MembershipBaseController {
           actionLabel = "Set Your Password";
         }
       }
-      try {
-        await UserHelper.sendInviteEmail(email, (personName || "").slice(0, 100), contextName.slice(0, 100), church?.name || "", loginLink, actionLabel, inviterEmail);
-        await ChurchEmailLimiter.settle(au.churchId, reserved[0], true);
-      } catch (err: any) {
-        await ChurchEmailLimiter.settle(au.churchId, reserved[0], false, err?.message || "Send failed");
-        throw err;
-      }
-
+      await UserHelper.sendInviteEmail(email, (personName || "").slice(0, 100), contextName.slice(0, 100), church?.name || "", loginLink, actionLabel, inviterEmail);
       return this.json({ success: true }, 200);
     });
   }

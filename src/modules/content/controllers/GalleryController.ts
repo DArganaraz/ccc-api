@@ -113,7 +113,10 @@ export class GalleryController extends ContentBaseController {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
-  private static apiBase(req: express.Request) {
+  // CONTENT_ROOT is the API's public address + "/content", which keeps a path prefix (e.g. /api behind Caddy)
+  // that the request itself has lost by the time it reaches us.
+  static apiBase(req: express.Request) {
+    if (/^https?:\/\/.+\/content\/?$/.test(Environment.contentRoot || "")) return Environment.contentRoot.replace(/\/content\/?$/, "");
     const xfProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
     const xfHost = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
     return `${xfProto || req.protocol || "https"}://${xfHost || req.get?.("host") || ""}`;

@@ -1,16 +1,21 @@
 import crypto from "crypto";
 import { controller, httpPost, requestParam } from "inversify-express-utils";
 import express from "express";
-import { getProvider, getProviderConfig, setProviderSecret, TokenHelper, ContentProviderConfig } from "@churchapps/content-providers";
+import { getProvider, getProviderConfig, setProviderSecret, TokenHelper, ContentProviderConfig, GoCurriculumProvider } from "@churchapps/content-providers";
 import { MembershipBaseController } from "./MembershipBaseController.js";
+import { PublicPersonRateLimiter } from "../helpers/PublicPersonRateLimiter.js";
+import { LoginRateLimiter } from "../helpers/LoginRateLimiter.js";
 
 const VERIFIER = /^[A-Za-z0-9\-._~]{43,128}$/;
 const CHALLENGE = /^[A-Za-z0-9\-_]{43,128}$/;
+// Each catalog call makes an outbound request to Go, so a caller is capped per IP. A church's TVs share one IP.
+const GO_CATALOG_PER_HOUR = 300;
 const SECRET_ENV: Record<string, string> = { onedrive: "ONEDRIVE_CLIENT_SECRET", googledrive: "GOOGLE_DRIVE_CLIENT_SECRET" };
 
 function applySecrets() {
   setProviderSecret("googledrive", process.env.GOOGLE_DRIVE_CLIENT_SECRET || "");
   setProviderSecret("onedrive", process.env.ONEDRIVE_CLIENT_SECRET || "");
+  setProviderSecret("gocurriculumFeeds", process.env.GOCURRICULUM_FEEDS || "");
 }
 
 function splitRedirect(stored: string): { redirectUri: string; codeChallenge: string } {
@@ -83,6 +88,22 @@ export class ProviderRelayTokenController extends MembershipBaseController {
       } catch { refreshed = null; }
       if (!refreshed?.access_token) return this.json({ error: "invalid_grant", error_description: "Failed to refresh tokens" }, 400);
       return this.json(deviceTokens(refreshed, refreshToken));
+    });
+  }
+
+  // Anonymous: the Go access token is the device credential. getCatalog verifies it with Go before returning the private catalog.
+  @httpPost("/gocurriculum/catalog")
+  public async goCurriculumCatalog(req: express.Request<{}, {}, { groupId?: string; accessToken?: string }>, res: express.Response): Promise<any> {
+    return this.actionWrapperAnon(req, res, async () => {
+      applySecrets();
+      const groupId = req.body?.groupId;
+      const accessToken = req.body?.accessToken;
+      if (typeof groupId !== "string" || typeof accessToken !== "string" || accessToken.length < 1 || accessToken.length > 4096) return this.json({ error: "invalid_request", error_description: "groupId and accessToken are required" }, 400);
+      if (!(await PublicPersonRateLimiter.allow(this.repos, LoginRateLimiter.getClientIp(req), "", "go-catalog", GO_CATALOG_PER_HOUR, 3600))) return this.json({ error: "too_many_requests" }, 429);
+      const provider = getProvider("gocurriculum") as GoCurriculumProvider | null;
+      const catalog = await provider?.getCatalog(groupId, { access_token: accessToken, refresh_token: "", token_type: "Bearer", created_at: 0, expires_in: 0, scope: "" });
+      if (!catalog) return this.json({ error: "not_found", error_description: "Invalid Go login or unknown group" }, 404);
+      return this.json(catalog);
     });
   }
 }

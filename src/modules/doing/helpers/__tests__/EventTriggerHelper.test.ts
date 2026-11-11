@@ -45,3 +45,37 @@ describe("EventTriggerHelper.resolve form.submission.created", () => {
     expect(result[0].subject.label).toBe("VBS");
   });
 });
+
+describe("EventTriggerHelper.fieldDefs membership status", () => {
+  it("offers Guest, the status self-registered people get, right after Visitor", () => {
+    const def = EventTriggerHelper.fieldDefs().find(d => d.eventType === "person.created");
+    const field = def.fields.find(f => f.key === "person.membershipStatus");
+    expect(field.options.map(o => o.value).slice(0, 2)).toEqual(["Visitor", "Guest"]);
+  });
+});
+
+describe("EventTriggerHelper donation.created context", () => {
+  it("carries the gift into the workflow it starts", async () => {
+    const { RepoManager } = jest.requireMock("../../../../shared/infrastructure/index.js");
+    const { ExecutionHelper } = jest.requireMock("../ExecutionHelper.js");
+    const { FilterMatcher } = jest.requireMock("../FilterMatcher.js");
+    const trigger = { id: "t1", workflowId: "wf1", conditions: "[]" };
+    RepoManager.getRepos.mockResolvedValue({ workflowTrigger: { loadEventTypesForChurch: jest.fn(async () => ["donation.created"]), loadByEventType: jest.fn(async () => [trigger]) } });
+    FilterMatcher.matches = () => true;
+    FilterMatcher.parseConditions = (): any[] => [];
+    FilterMatcher.toBool = () => false;
+    jest.spyOn(EventTriggerHelper as any, "eventTypesForChurch").mockResolvedValue(new Set(["donation.created"]));
+    jest.spyOn(EventTriggerHelper as any, "resolve").mockResolvedValue([{ subject: { type: "person", id: "p1", label: "Donald Clark" }, facts: {} }]);
+
+    const donationDate = new Date("2026-11-08T00:00:00Z");
+    await EventTriggerHelper.onEvent("c1", "donation.created", { id: "d1", personId: "p1", amount: 50, currency: "usd", donationDate, method: "Check" });
+
+    expect(ExecutionHelper.startAndAttempt).toHaveBeenCalledWith(
+      trigger,
+      { type: "person", id: "p1", label: "Donald Clark" },
+      "donation.created",
+      expect.anything(),
+      { type: "donation.created", donationId: "d1", amount: 50, currency: "usd", donationDate, method: "Check" }
+    );
+  });
+});

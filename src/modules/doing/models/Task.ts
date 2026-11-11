@@ -24,7 +24,9 @@ export class Task {
   public workflowId?: string;
   public stepId?: string;
   public dueDate?: Date;
-  public snoozedUntil?: Date;
+  public snoozedUntil?: Date | null;
   public sort?: number;
   public pinnedAssignment?: boolean;
+  public assignmentId?: string | null;
+  public followupKey?: string | null;
 }

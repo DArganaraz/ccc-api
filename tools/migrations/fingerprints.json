@@ -817,6 +817,39 @@
     }
    ],
    "schemaChanges": 1
+  },
+  "2026-10-22_oauth_token_replaced_by": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "oAuthTokens",
+     "column": "replacedById",
+     "present": true
+    }
+   ],
+   "schemaChanges": 1
+  },
+  "2026-10-25_form_photo": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "forms",
+     "column": "photoUrl",
+     "present": true
+    }
+   ],
+   "schemaChanges": 1
+  },
+  "2026-10-26_person_date_added": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "people",
+     "column": "dateAdded",
+     "present": true
+    }
+   ],
+   "schemaChanges": 1
   }
  },
  "attendance": {
@@ -1713,6 +1746,40 @@
     }
    ],
    "schemaChanges": 1
+  },
+  "2026-10-17_batch_status": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "donationBatches",
+     "column": "status",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "donationBatches",
+     "column": "closedDate",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "donationBatches",
+     "column": "closedBy",
+     "present": true
+    }
+   ],
+   "schemaChanges": 3
+  },
+  "2026-11-01_donation_entered_by": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "donations",
+     "column": "enteredBy",
+     "present": true
+    }
+   ],
+   "schemaChanges": 1
   }
  },
  "messaging": {
@@ -1921,6 +1988,16 @@
      "column": "deliveryMethod",
      "type": "varchar(30)",
      "nullable": true
+    }
+   ],
+   "schemaChanges": 1
+  },
+  "2026-11-02_scheduled_notifications": {
+   "checks": [
+    {
+     "kind": "table",
+     "table": "scheduledNotifications",
+     "present": true
     }
    ],
    "schemaChanges": 1
@@ -2331,6 +2408,81 @@
     }
    ],
    "schemaChanges": 1
+  },
+  "2026-10-22_assignment_confirmation_workflows": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "plans",
+     "column": "confirmationWorkflowId",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "assignments",
+     "column": "confirmationWorkflowId",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "workflows",
+     "column": "workflowType",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "tasks",
+     "column": "assignmentId",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "tasks",
+     "column": "followupKey",
+     "present": true
+    },
+    {
+     "kind": "index",
+     "table": "tasks",
+     "index": "idx_tasks_assignment",
+     "present": true
+    },
+    {
+     "kind": "index",
+     "table": "tasks",
+     "index": "uq_tasks_followup",
+     "present": true
+    }
+   ],
+   "schemaChanges": 7
+  },
+  "2026-10-25_workflowTriggers_allowRepeatAfterClose": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "workflowTriggers",
+     "column": "allowRepeatAfterClose",
+     "present": true
+    }
+   ],
+   "schemaChanges": 1
+  },
+  "2026-11-02_lesson_trim": {
+   "checks": [
+    {
+     "kind": "column",
+     "table": "planTypes",
+     "column": "lessonTrim",
+     "present": true
+    },
+    {
+     "kind": "column",
+     "table": "plans",
+     "column": "lessonTrimWarning",
+     "present": true
+    }
+   ],
+   "schemaChanges": 2
   }
  }
 }

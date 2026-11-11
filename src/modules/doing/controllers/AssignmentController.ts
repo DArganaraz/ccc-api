@@ -1,10 +1,13 @@
 import { controller, httpPost, httpGet, requestParam, httpDelete } from "inversify-express-utils";
 import express from "express";
 import { DoingBaseController } from "./DoingBaseController.js";
-import { Assignment, Plan, Position } from "../models/index.js";
+import { Assignment, Plan, Position, Time } from "../models/index.js";
 import { PlanAuth } from "../../../shared/helpers/index.js";
+import { DateHelper } from "../../../shared/helpers/DateHelper.js";
+import { InternalEventBus } from "../../../shared/events/InternalEventBus.js";
 import { PlanHelper } from "../helpers/PlanHelper.js";
 import { ReminderTokenHelper } from "../helpers/ReminderTokenHelper.js";
+import { SignupDeadlineHelper } from "../helpers/SignupDeadlineHelper.js";
 
 @controller("/doing/assignments")
 export class AssignmentController extends DoingBaseController {
@@ -63,6 +66,7 @@ export class AssignmentController extends DoingBaseController {
       else {
         assignment.status = "Accepted";
         const result = await this.repos.assignment.save(assignment);
+        await InternalEventBus.publish(au.churchId, "assignment.updated", result);
         await PlanHelper.notifyLeadersOfResponse(au.churchId, assignment, this.repos);
         return result;
       }
@@ -78,6 +82,7 @@ export class AssignmentController extends DoingBaseController {
       else {
         assignment.status = "Declined";
         const result = await this.repos.assignment.save(assignment);
+        await InternalEventBus.publish(au.churchId, "assignment.updated", result);
         try {
           await PlanHelper.autoReplaceDeclined(au.churchId, assignment, this.repos);
         } catch (e) {
@@ -115,6 +120,18 @@ export class AssignmentController extends DoingBaseController {
       const assignment = (await repos.assignment.load(payload.churchId, payload.assignmentId)) as Assignment;
       if (!assignment) { res.status(404).send(page("Not found", "We couldn't find that serving request.")); return; }
 
+      // New confirmation links are bound to the issued person/role/service, so an
+      // old bearer link cannot answer a reassigned or rescheduled request.
+      if (payload.request) {
+        const position = await repos.position.load(payload.churchId, assignment.positionId) as Position;
+        const plan = position ? await repos.plan.load(payload.churchId, position.planId) as Plan : null;
+        const sameSubject = assignment.personId === payload.request.personId && assignment.positionId === payload.request.positionId;
+        const samePlan = plan && plan.id === payload.request.planId && !plan.prepared && DateHelper.toMysqlDateOnly(plan.serviceDate) === payload.request.serviceDate;
+        if (!sameSubject || !samePlan) {
+          res.status(400).send(page("Request changed", "This request has changed. Please open the app to review your current schedule.")); return;
+        }
+      }
+
       const target = payload.action === "accept" ? "Accepted" : "Declined";
       if (!apply && assignment.status !== target) {
         const label = target === "Accepted" ? "Accept" : "Decline";
@@ -125,6 +142,7 @@ export class AssignmentController extends DoingBaseController {
       if (assignment.status !== target) {
         assignment.status = target;
         await repos.assignment.save(assignment);
+        await InternalEventBus.publish(payload.churchId, "assignment.updated", assignment);
         if (target === "Declined") {
           try {
             await PlanHelper.autoReplaceDeclined(payload.churchId, assignment, repos);
@@ -157,10 +175,8 @@ export class AssignmentController extends DoingBaseController {
       // Check signup deadline
       const plan = (await this.repos.plan.load(au.churchId, position.planId)) as Plan;
       if (!plan) return this.json({}, 404);
-      if (plan.signupDeadlineHours) {
-        const deadline = new Date(plan.serviceDate);
-        deadline.setHours(deadline.getHours() - plan.signupDeadlineHours);
-        if (new Date() > deadline) throw new Error("Signup deadline has passed");
+      if (plan.signupDeadlineHours && await SignupDeadlineHelper.hasPassed(au.churchId, plan, await this.repos.time.loadByPlanId(au.churchId, plan.id) as Time[])) {
+        throw new Error("Signup deadline has passed");
       }
 
       // Check capacity
@@ -192,13 +208,12 @@ export class AssignmentController extends DoingBaseController {
 
       // Check removal deadline
       const plan = (await this.repos.plan.load(au.churchId, position.planId)) as Plan;
-      if (plan.signupDeadlineHours) {
-        const deadline = new Date(plan.serviceDate);
-        deadline.setHours(deadline.getHours() - plan.signupDeadlineHours);
-        if (new Date() > deadline) throw new Error("Removal deadline has passed");
+      if (plan?.signupDeadlineHours && await SignupDeadlineHelper.hasPassed(au.churchId, plan, await this.repos.time.loadByPlanId(au.churchId, plan.id) as Time[])) {
+        throw new Error("Removal deadline has passed");
       }
 
       await this.repos.assignment.delete(au.churchId, id);
+      await InternalEventBus.publish(au.churchId, "assignment.destroyed", { id });
       return {};
     });
   }
@@ -222,6 +237,7 @@ export class AssignmentController extends DoingBaseController {
         promises.push(this.repos.assignment.save(assignment));
       });
       const result = await Promise.all(promises);
+      for (const saved of result) await InternalEventBus.publish(au.churchId, "assignment.updated", saved);
       return result;
     });
   }
@@ -232,6 +248,7 @@ export class AssignmentController extends DoingBaseController {
       const assignment: any = await this.repos.assignment.load(au.churchId, id);
       if (!await PlanAuth.canEditPosition(au, assignment?.positionId)) return this.json({}, 401);
       await this.repos.assignment.delete(au.churchId, id);
+      await InternalEventBus.publish(au.churchId, "assignment.destroyed", { id });
       return {};
     });
   }

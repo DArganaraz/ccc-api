@@ -5,10 +5,11 @@ jest.mock("../../../../shared/helpers/index", () => ({ Permissions: { attendance
 jest.mock("../../../../shared/webhooks/index", () => ({ WebhookDispatcher: { emit: jest.fn() } }));
 jest.mock("../../helpers/index", () => ({
   SecurityCodeHelper: { generate: () => "ABCD" },
-  CheckinGateHelper: jest.requireActual("../../helpers/CheckinGateHelper").CheckinGateHelper
+  CheckinGateHelper: jest.requireActual("../../helpers/CheckinGateHelper").CheckinGateHelper,
+  CheckinTimeZoneHelper: jest.requireActual("../../helpers/CheckinTimeZoneHelper").CheckinTimeZoneHelper
 }));
 
-const gateway = { loadGroupsForCheckin: jest.fn(), loadSetting: jest.fn(), loadHouseholdPeople: jest.fn(), loadChurch: jest.fn() };
+const gateway = { loadGroupsForCheckin: jest.fn(), loadSetting: jest.fn(), loadHouseholdPeople: jest.fn(), loadChurch: jest.fn(), loadCampusTimeZones: jest.fn(async () => ({})), loadCampusTimeZone: jest.fn(async () => null) };
 jest.mock("../../../../shared/modules/index", () => ({ getMembershipModuleGateway: () => gateway }));
 
 import { VisitController } from "../VisitController.js";
@@ -19,7 +20,7 @@ function makeController(opts: any = {}) {
       convertAllToModel: (_c: string, rows: any[]) => rows,
       convertToModel: (_c: string, row: any) => row,
       loadLastLoggedDate: jest.fn(async () => null),
-      loadByServiceDatePeopleIds: jest.fn(async () => []),
+      loadByServiceDatePeopleIds: jest.fn(async () => opts.visits ?? []),
       loadByCodeToday: jest.fn(async () => []),
       countActiveByGroupToday: jest.fn(async () => opts.counts ?? []),
       save: jest.fn(async (v: any) => { if (!v.id) v.id = "vis1"; return v; }),
@@ -28,12 +29,15 @@ function makeController(opts: any = {}) {
     },
     visitSession: {
       convertAllToModel: (_c: string, rows: any[]) => rows,
-      loadByVisitIds: jest.fn(async () => []),
+      loadByVisitIds: jest.fn(async () => opts.visitSessions ?? []),
       save: jest.fn(async (v: any) => v),
       delete: jest.fn()
     },
     serviceTime: { loadByIds: jest.fn(async () => opts.serviceTimes ?? []) },
+    service: { loadAll: jest.fn(async () => []) },
     session: {
+      convertAllToModel: (_c: string, rows: any[]) => rows,
+      loadByIds: jest.fn(async () => opts.sessions ?? []),
       loadByGroupServiceTimeDate: jest.fn(async () => ({ id: "sess1" })),
       save: jest.fn(async (s: any) => { s.id = "sess1"; return s; })
     }
@@ -43,7 +47,7 @@ function makeController(opts: any = {}) {
   gateway.loadHouseholdPeople.mockResolvedValue(opts.household ?? [{ id: "p1" }]);
   gateway.loadChurch.mockResolvedValue({ id: "c1", timeZone: "America/Chicago" });
 
-  const au = { churchId: "c1", id: "u1", checkAccess: () => true };
+  const au = opts.au ?? { churchId: "c1", id: "u1", checkAccess: () => true };
   const controller = new VisitController();
   (controller as any).repos = repos;
   (controller as any).actionWrapper = (_req: any, _res: any, action: any) => action(au);
@@ -62,6 +66,24 @@ beforeEach(() => {
   gateway.loadSetting.mockReset();
   gateway.loadHouseholdPeople.mockReset();
   gateway.loadChurch.mockReset();
+});
+
+// ChurchAppsSupport#1426: removing Check-in from Everyone must leave family self check-in working.
+describe("self check-in without the Check-in permission", () => {
+  const member = { churchId: "c1", id: "u1", personId: "p1", checkAccess: () => false };
+
+  it("saves a check-in for the caller's own household", async () => {
+    const { controller, repos } = makeController({ au: member });
+    await (controller as any).postCheckin(req(memberVisit()), {});
+    expect(repos.visit.save).toHaveBeenCalled();
+  });
+
+  it("refuses a check-in for someone outside the household", async () => {
+    const { controller, repos } = makeController({ au: member, household: [{ id: "p1" }] });
+    const result: any = await (controller as any).postCheckin({ ...req(memberVisit()), query: { serviceId: "s1", peopleIds: "p2" } }, {});
+    expect(result.status).toBe(403);
+    expect(repos.visit.save).not.toHaveBeenCalled();
+  });
 });
 
 describe("postCheckin capacity gate", () => {
@@ -95,10 +117,29 @@ describe("postCheckin service time window", () => {
     expect(repos.visit.save).not.toHaveBeenCalled();
   });
 
+  it("re-posts a session the person already holds after its window closes, so another time can be added", async () => {
+    jest.useFakeTimers({ now: new Date("2026-10-13T09:00:00-05:00"), doNotFake: ["setTimeout", "nextTick", "setImmediate"] });
+    const visits = [{ id: "v0", personId: "p1" }];
+    const visitSessions = [{ id: "vs0", visitId: "v0", sessionId: "sess1" }];
+    const { controller, repos } = makeController({ groups, counts: [], serviceTimes: [sunday9], visits, visitSessions });
+    const result: any = await (controller as any).postCheckin(req(memberVisit()), {});
+    expect(result?.status).not.toBe(409);
+    expect(repos.visit.save).toHaveBeenCalled();
+  });
+
   it("saves inside the check-in window", async () => {
     jest.useFakeTimers({ now: new Date("2026-10-11T08:45:00-05:00"), doNotFake: ["setTimeout", "nextTick", "setImmediate"] });
     const { controller, repos } = makeController({ groups, counts: [], serviceTimes: [sunday9] });
     await (controller as any).postCheckin(req(memberVisit()), {});
+    expect(repos.visit.save).toHaveBeenCalled();
+  });
+
+  it("saves 40 minutes after the start when the schedule has no end time or close minutes (#1461)", async () => {
+    jest.useFakeTimers({ now: new Date("2026-10-11T09:40:00-05:00"), doNotFake: ["setTimeout", "nextTick", "setImmediate"] });
+    const startOnly = { id: "st1", dayOfWeek: 0, startTime: "09:00:00", endTime: null, checkinOpenMinutes: null, checkinCloseMinutes: null };
+    const { controller, repos } = makeController({ groups, counts: [], serviceTimes: [startOnly] });
+    const result: any = await (controller as any).postCheckin(req(memberVisit()), {});
+    expect(result?.status).not.toBe(409);
     expect(repos.visit.save).toHaveBeenCalled();
   });
 });
@@ -250,3 +291,27 @@ describe("self check-in household scoping", () => {
   });
 });
 
+
+describe("check-in with a visit session whose session row is gone", () => {
+  // Production: POST /attendance/visits/checkin 500'd reading vs.session.serviceTimeId after a client re-posted
+  // the visits GET /checkin returned, which included a visitSession with no matching session (NULL or deleted sessionId).
+  const today = new Date();
+  const visits = () => [{ id: "v1", personId: "p1", visitDate: today, securityCode: "ABCD" }];
+  const visitSessions = () => [{ id: "vs1", visitId: "v1", sessionId: "sess1" }, { id: "vs2", visitId: "v1", sessionId: null }];
+
+  it("getCheckin leaves out visit sessions it cannot attach a session to", async () => {
+    const { controller } = makeController({ visits: visits(), visitSessions: visitSessions(), sessions: [{ id: "sess1", serviceTimeId: "st1", groupId: "g1" }] });
+    const result: any = await (controller as any).getCheckin(req(null), {});
+    expect(result).toHaveLength(1);
+    expect(result[0].visitSessions).toHaveLength(1);
+    expect(result[0].visitSessions[0].session.serviceTimeId).toBe("st1");
+  });
+
+  it("postCheckin answers 400 for a visit session without a session, and saves nothing", async () => {
+    const { controller, repos } = makeController();
+    const result: any = await (controller as any).postCheckin(req([{ personId: "p1", checkinType: "member", visitSessions: [{ sessionId: "gone" }] }]), {});
+    expect(result.status).toBe(400);
+    expect(repos.visit.save).not.toHaveBeenCalled();
+    expect(repos.session.save).not.toHaveBeenCalled();
+  });
+});

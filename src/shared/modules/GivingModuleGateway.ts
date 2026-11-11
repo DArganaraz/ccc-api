@@ -1,5 +1,15 @@
 import { RepoManager } from "../infrastructure/RepoManager.js";
 import { KyselyPool } from "../infrastructure/KyselyPool.js";
+import { LapsedGiverMatch, LapsedGiverRule } from "../../modules/giving/helpers/LapsedGiverMatch.js";
+import { ReceiptHelper } from "../../modules/giving/helpers/ReceiptHelper.js";
+
+export interface DonationReceiptSummary {
+  amount: number;
+  currency?: string;
+  donationDate?: string | Date;
+  method?: string;
+  funds: { name: string; amount: number }[];
+}
 
 // Gateway: the only seam through which other modules read giving data.
 export interface GivingModuleGateway {
@@ -9,10 +19,16 @@ export interface GivingModuleGateway {
   // Non-sensitive descriptors only — never gateway tokens or raw payment details.
   loadPaymentMethodsByPerson(churchId: string, personId: string): Promise<any[]>;
   loadFundDonations(churchId: string, donationId: string): Promise<{ fundId: string; amount: number }[]>;
+  // One gift with its fund names, for the workflow gift merge fields.
+  loadDonationSummary(churchId: string, donationId: string): Promise<DonationReceiptSummary | null>;
+  // The same fund/amount table the online giving receipt email shows.
+  buildReceiptHtml(summary: DonationReceiptSummary): string;
   // List-condition provider: people who donated in the window (optionally to one fund).
   loadDonorPersonIds(churchId: string, fundId: string | null, startDate: Date, endDate: Date): Promise<string[]>;
   // First-time-donor detection: total donation rows for the person (the new one included).
   loadDonationCountForPerson(churchId: string, personId: string): Promise<number>;
+  // Workflow "lapsed regular giver" rule: person ids only, never amounts. anchorDate is the church-local YYYY-MM-DD.
+  loadLapsedRegularGiverIds(churchId: string, anchorDate: string, rule: Partial<LapsedGiverRule>): Promise<string[]>;
   // Command palette catalog: fund names only, never donation rows.
   loadPalette(churchId: string): Promise<{ id: string; name: string }[]>;
 }
@@ -72,6 +88,19 @@ class GivingModuleGatewayDb implements GivingModuleGateway {
     return (await this.repos()).fundDonation.loadByDonationId(churchId, donationId);
   }
 
+  public async loadDonationSummary(churchId: string, donationId: string): Promise<DonationReceiptSummary | null> {
+    const repos = await this.repos();
+    const donation = await repos.donation.load(churchId, donationId);
+    if (!donation) return null;
+    const rows: any[] = await repos.fundDonation.loadByDonationId(churchId, donationId);
+    const funds = await Promise.all(rows.map(async (r) => ({ name: (await repos.fund.load(churchId, r.fundId))?.name || "", amount: Number(r.amount || 0) })));
+    return { amount: Number(donation.amount || 0), currency: donation.currency, donationDate: donation.donationDate, method: donation.method, funds };
+  }
+
+  public buildReceiptHtml(summary: DonationReceiptSummary): string {
+    return ReceiptHelper.oneTimeTable(summary.funds, summary.amount, summary.currency || "USD");
+  }
+
   public async loadDonationCountForPerson(churchId: string, personId: string): Promise<number> {
     const db = KyselyPool.getDb("giving") as any;
     const row = await db.selectFrom("donations")
@@ -80,6 +109,21 @@ class GivingModuleGatewayDb implements GivingModuleGateway {
       .where("personId", "=", personId)
       .executeTakeFirst();
     return Number(row?.total || 0);
+  }
+
+  public async loadLapsedRegularGiverIds(churchId: string, anchorDate: string, requested: Partial<LapsedGiverRule>): Promise<string[]> {
+    const rule = LapsedGiverMatch.parseRule(requested);
+    const { regularStart } = LapsedGiverMatch.windows(anchorDate, rule);
+    const db = KyselyPool.getDb("giving") as any;
+    const rows = await db.selectFrom("donations")
+      .select(["personId", "donationDate"])
+      .where("churchId", "=", churchId)
+      .where("personId", "is not", null)
+      .where("personId", "!=", "")
+      .where("donationDate", ">=", regularStart)
+      .where((eb: any) => eb.or([eb("status", "is", null), eb("status", "=", "complete")]))
+      .execute();
+    return LapsedGiverMatch.match(rows, anchorDate, rule);
   }
 
   public async loadDonorPersonIds(churchId: string, fundId: string | null, startDate: Date, endDate: Date) {

@@ -136,6 +136,7 @@ export const createApp = async () => {
         status: "healthy",
         timestamp: new Date().toISOString(),
         environment: Environment.currentEnvironment,
+        node: process.version,
         modules: ["attendance", "content", "doing", "giving", "membership", "messaging"]
       });
     });

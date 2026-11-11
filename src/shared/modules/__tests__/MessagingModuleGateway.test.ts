@@ -4,12 +4,25 @@ jest.mock("../../../modules/messaging/helpers/NotificationHelper.js", () => ({ N
 const loadByIdMock = jest.fn();
 jest.mock("../../infrastructure/RepoManager.js", () => ({ RepoManager: { getRepos: jest.fn(async () => ({ emailTemplate: { loadById: loadByIdMock } })) } }));
 
+const remainingMock = jest.fn().mockResolvedValue(150);
+jest.mock("../../helpers/ChurchEmailLimiter.js", () => ({ ChurchEmailLimiter: { remaining: (...args: unknown[]) => remainingMock(...args) } }));
+
 import { getMessagingModuleGateway } from "../MessagingModuleGateway.js";
 
 describe("MessagingModuleGateway.sendTemplatedEmail", () => {
   beforeEach(() => {
     createNotificationsMock.mockClear();
     loadByIdMock.mockReset();
+    remainingMock.mockResolvedValue(150);
+  });
+
+  // #1338: an unapproved church's email is dropped downstream, so the card must not record "Email sent".
+  it("returns false without notifying when the church has no email allowance (not approved)", async () => {
+    loadByIdMock.mockResolvedValue({ subject: "Hi", htmlContent: "<p>Hi</p>" });
+    remainingMock.mockResolvedValue(0);
+    const result = await getMessagingModuleGateway().sendTemplatedEmail("c1", "p1", "t1", { email: "pat@example.com" }, "Church");
+    expect(result).toBe(false);
+    expect(createNotificationsMock).not.toHaveBeenCalled();
   });
 
   it("returns false without notifying when the recipient has no email", async () => {
@@ -50,13 +63,22 @@ describe("MessagingModuleGateway.sendTemplatedEmail", () => {
     ] = createNotificationsMock.mock.calls[0];
     expect(personIds).toEqual(["p1"]);
     expect(churchId).toBe("c1");
-    expect(contentType).toBe("task");
+    expect(contentType).toBe("email");
     expect(contentId).toBe("t1");
     expect(message).toBe("Hi Pat");
     expect(link).toBeUndefined();
     expect(triggeredBy).toBeUndefined();
     expect(options).toMatchObject({ category: "announcements", deliveryStartLevel: 2, emailImmediate: true });
     expect(options.emailByPerson.p1).toEqual({ subject: "Hi Pat", html: "<p>Welcome Pat to Grace Church</p>" });
+  });
+
+  // #1259: contentId is the email template id, so a "task" row sent the bell click to a missing task.
+  it("does not label the template notification as a task", async () => {
+    loadByIdMock.mockResolvedValue({ subject: "Thanks", htmlContent: "<p>Body</p>" });
+
+    await getMessagingModuleGateway().sendTemplatedEmail("c1", "p1", "TPL1", { email: "pat@example.com" }, "Grace Church");
+
+    expect(createNotificationsMock.mock.calls[0][2]).not.toBe("task");
   });
 
   it("uses subjectOverride instead of the template's saved subject when provided", async () => {

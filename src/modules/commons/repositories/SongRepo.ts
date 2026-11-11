@@ -1,6 +1,7 @@
 import { injectable } from "inversify";
 import { sql } from "kysely";
 import { getDb } from "../db/index.js";
+import { publishedBy } from "./AssetRepo.js";
 import { Song, SongView } from "../models/index.js";
 
 // Spine and author fields are aliased back to the legacy song names the site consumes.
@@ -74,8 +75,13 @@ const SONG_COLS = [
   "songs.contributors"
 ] as const;
 
-const SUMMARY_COLS = [...SPINE_COLS, ...AUTHOR_COLS, ...SUMMARY_SONG_COLS, RANK_COL];
-const FULL_COLS = [...MODERATION_SPINE_COLS, ...AUTHOR_COLS, ...SONG_COLS, RANK_COL];
+// ponytail: the LLM part of the moderation score under QUALITY_FLOOR demotes a song off the home page and to the bottom of the library.
+// Unscored (null) and heuristic-only (llm 0) songs pass, so a missing key never hides the catalog. Raise the floor if junk still shows.
+export const QUALITY_FLOOR = 25;
+const DEMOTED_COL = sql<boolean>`(coalesce(json_extract(songs.qualityDetail, '$.llm'), 0) between 1 and ${QUALITY_FLOOR - 1})`.as("demoted");
+
+const SUMMARY_COLS = [...SPINE_COLS, ...AUTHOR_COLS, ...SUMMARY_SONG_COLS, RANK_COL, DEMOTED_COL];
+const FULL_COLS = [...MODERATION_SPINE_COLS, ...AUTHOR_COLS, ...SONG_COLS, RANK_COL, DEMOTED_COL];
 
 const PACKAGE_COLS = [
   "confidence",
@@ -137,7 +143,7 @@ export class SongRepo {
   }
 
   public async loadBySubmitter(submittedBy: string): Promise<SongView[]> {
-    return await this.joined().select(SUMMARY_COLS).where("assets.publisherUserId", "=", submittedBy)
+    return await this.joined().select(SUMMARY_COLS).where(publishedBy(submittedBy))
       .orderBy("assets.createdAt", "desc").execute() as SongView[];
   }
 
@@ -149,7 +155,11 @@ export class SongRepo {
 
   public async loadUnscored(limit: number): Promise<SongView[]> {
     return await this.joined().select(FULL_COLS)
-      .where("songs.qualityScore", "is", null).where("assets.status", "!=", "removed").limit(limit).execute() as SongView[];
+      // heuristic-only rows (llm 0, scored while the key was missing) get re-scored too
+      .where((eb) => eb.or([eb("songs.qualityScore", "is", null), eb(sql`json_extract(songs.qualityDetail, '$.llm')`, "=", 0)]))
+      .where("assets.status", "!=", "removed")
+      // heuristic-only uploads first, then the never-scored hymnal imports; the caller can stop after the first group
+      .orderBy(sql`songs.qualityScore is null`).orderBy("assets.createdAt", "desc").limit(limit).execute() as SongView[];
   }
 
   public async loadById(assetId: string): Promise<SongView | undefined> {

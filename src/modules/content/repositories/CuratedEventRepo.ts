@@ -86,20 +86,20 @@ export class CuratedEventRepo {
         "e.allDay",
         "e.recurrenceRule",
         "e.visibility",
-        "e.photoUrl"
+        "e.photoUrl",
+        "e.tags"
       ])
       .where("ce.curatedCalendarId", "=", curatedCalendarId)
       .where("ce.churchId", "=", churchId);
     if (!includePrivate) query = query.where("e.visibility", "=", "public");
-    // An event can be on the calendar twice: through its whole group and on its own. Return it once,
-    // keeping its own entry so removing just that event from the calendar still works.
-    const rows: any[] = await query.execute();
+    const rows = await query.execute();
+    // An event listed on its own and through its whole group comes back once, as the group row.
     const byEvent = new Map<string, any>();
-    for (const row of rows) {
-      const kept = byEvent.get(row.realEventId);
-      if (!kept || (!kept.eventId && row.eventId)) byEvent.set(row.realEventId, row);
-    }
-    return [...byEvent.values()];
+    rows.forEach((row: any) => {
+      const current = byEvent.get(row.realEventId);
+      if (!current || (current.eventId && !row.eventId)) byEvent.set(row.realEventId, row);
+    });
+    return rows.filter((row: any) => byEvent.get(row.realEventId) === row);
   }
 
   public convertToModel(_churchId: string, data: any) { return data as CuratedEvent; }

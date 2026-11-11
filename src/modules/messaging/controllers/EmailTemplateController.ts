@@ -40,7 +40,8 @@ export class EmailTemplateController extends MessagingBaseController {
   @httpGet("/sendStatus")
   public async sendStatus(req: express.Request, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      if (!au.checkAccess(Permissions.groupMembers.edit)) return this.json({}, 401);
+      // Workflow managers read it too, so the Send Email action can warn when mail won't go out.
+      if (!au.checkAccess(Permissions.groupMembers.edit) && !au.checkAccess(Permissions.tasks.admin)) return this.json({}, 401);
       const status = await ChurchEmailLimiter.status(au.churchId);
       const requested = !status.approved && (await this.repos.deliveryLog.countByMethodSince(au.churchId, "emailApprovalRequest", new Date(Date.now() - 7 * DAY_MS))) > 0;
       return { ...status, requested };
@@ -140,7 +141,7 @@ export class EmailTemplateController extends MessagingBaseController {
 
       let successCount = 0;
       let failCount = 0;
-      const from = Environment.supportEmail;
+      const from = TransactionalEmailHelper.fromAddress(churchName);
       const replyTo = au.email || undefined;
 
       for (let i = 0; i < eligible.length; i++) {

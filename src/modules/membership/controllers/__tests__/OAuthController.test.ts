@@ -3,7 +3,9 @@ jest.mock("../MembershipBaseController", () => ({ MembershipBaseController: clas
 jest.mock("../../helpers/index", () => ({
   Permissions: { settings: { edit: "settingsEdit" }, server: { admin: "serverAdmin" } },
   UniqueIdHelper: { shortId: () => "short", secret: () => "a".repeat(64) },
-  UserHelper: { loadExpandedPermissions: jest.fn(async () => []) }
+  UserHelper: { loadExpandedPermissions: jest.fn(async () => []) },
+  PublicPersonRateLimiter: { allow: jest.fn(async () => true) },
+  LoginRateLimiter: { getClientIp: () => "127.0.0.1" }
 }));
 jest.mock("../../auth/index", () => ({ AuthenticatedUser: { getCombinedApiJwt: jest.fn() } }));
 jest.mock("../../models/index", () => ({}));
@@ -12,7 +14,7 @@ jest.mock("../../repositories/index", () => ({
   OAuthRelaySessionRepo: { generateSessionCode: () => "sc" }
 }));
 jest.mock("../../../../shared/helpers/Environment.js", () => ({ Environment: { membershipApi: "https://api.example", b1AdminRoot: "https://admin.example", oauthAccessTokenSeconds: 10 } }));
-jest.mock("../../../../shared/auth/Scopes.js", () => ({ parseScopes: () => [] }));
+jest.mock("../../../../shared/auth/Scopes.js", () => ({ parseScopes: () => [], listAllScopes: () => ["people:read"] }));
 jest.mock("../../helpers/OAuthConnectionHelper.js", () => ({ toConnections: (rows: any) => rows }));
 
 import { OAuthController } from "../OAuthController.js";
@@ -177,5 +179,245 @@ describe("OAuthController relay + device code hardening", () => {
     const result: any = await (controller as any).denyDevice({ body: { user_code: "ABCD" } }, {});
     expect(result.status).toBe(400);
     expect(repos.oAuthDeviceCode.save).not.toHaveBeenCalled();
+  });
+});
+
+describe("OAuthController MCP connector sign-in (DCR + PKCE)", () => {
+  // RFC 7636 Appendix B verifier/challenge pair.
+  const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+  const challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+  const claudeCallback = "https://claude.ai/api/mcp/auth_callback";
+  const publicClient = { id: "cl1", clientId: "pub1", name: "Claude", clientSecret: null as any, redirectUris: claudeCallback, selfRegistered: 1 };
+
+  function mcpController(opts: any = {}) {
+    const repos: any = {
+      oAuthClient: {
+        loadByClientId: jest.fn(async () => opts.client ?? publicClient),
+        loadByClientIdAndSecret: jest.fn(async () => null),
+        save: jest.fn(async (c: any) => ({ ...c, id: "new" }))
+      },
+      oAuthCode: {
+        save: jest.fn(async (c: any) => c),
+        loadByCode: jest.fn(async () => opts.code ?? null),
+        consume: jest.fn(async () => true),
+        delete: jest.fn()
+      },
+      userChurch: {
+        loadByUserId: jest.fn(async () => ({ id: "uc1" })),
+        load: jest.fn(async () => ({ id: "uc1", userId: "u1", churchId: "ch1", personId: "p1" }))
+      },
+      user: { load: jest.fn(async () => ({ id: "u1", email: "a@b.c" })) },
+      church: { loadById: jest.fn(async () => ({ id: "ch1", name: "Grace", subDomain: "grace" })) },
+      person: { loadByIdsOnly: jest.fn(async () => [{ membershipStatus: "Member" }]) },
+      groupMember: { loadForPeople: jest.fn(async () => []) },
+      oAuthToken: { save: jest.fn(async (t: any) => t) }
+    };
+    const controller = new OAuthController();
+    (controller as any).repos = repos;
+    (controller as any).actionWrapper = (_req: any, _res: any, action: any) => action({ id: "u1", churchId: "ch1" });
+    (controller as any).actionWrapperAnon = (_req: any, _res: any, action: any) => action();
+    (controller as any).json = (obj: any, status: number = 200) => ({ obj, status });
+    return { controller, repos };
+  }
+
+  it("lets a public client register itself with https and loopback redirect URIs and issues no secret", async () => {
+    const { controller, repos } = mcpController();
+    const result: any = await (controller as any).register({ body: { client_name: "Claude", redirect_uris: [claudeCallback, "http://localhost:33418/callback"], token_endpoint_auth_method: "client_secret_post" } }, {});
+    expect(result.status).toBe(201);
+    expect(result.obj.client_id).toBe("short");
+    expect(result.obj.client_secret).toBeUndefined();
+    expect(result.obj.token_endpoint_auth_method).toBe("none");
+    expect(result.obj.redirect_uris).toEqual([claudeCallback, "http://localhost:33418/callback"]);
+    expect(repos.oAuthClient.save).toHaveBeenCalledWith(expect.objectContaining({ clientId: "short", name: "Claude", selfRegistered: true, clientSecret: null }));
+  });
+
+  it.each([["http://evil.example/callback"], ["javascript:alert(1)"], ["https://claude.ai/cb#frag"]])("refuses to register redirect URI %s", async (uri) => {
+    const { controller, repos } = mcpController();
+    const result: any = await (controller as any).register({ body: { client_name: "X", redirect_uris: [uri] } }, {});
+    expect(result.status).toBe(400);
+    expect(result.obj.error).toBe("invalid_redirect_uri");
+    expect(repos.oAuthClient.save).not.toHaveBeenCalled();
+  });
+
+  it("stores the S256 code challenge with the authorization code", async () => {
+    const { controller, repos } = mcpController();
+    const result: any = await controller.authorize({ body: { client_id: "pub1", redirect_uri: claudeCallback, response_type: "code", scope: "people:read", code_challenge: challenge, code_challenge_method: "S256" } } as any, {} as any);
+    expect(result.obj.code).toBeTruthy();
+    expect(repos.oAuthCode.save).toHaveBeenCalledWith(expect.objectContaining({ codeChallenge: challenge, codeChallengeMethod: "S256", userChurchId: "uc1" }));
+  });
+
+  it("requires a code challenge from a client that has no secret", async () => {
+    const { controller, repos } = mcpController();
+    const result: any = await controller.authorize({ body: { client_id: "pub1", redirect_uri: claudeCallback, response_type: "code", scope: "people:read" } } as any, {} as any);
+    expect(result.status).toBe(400);
+    expect(result.obj.error).toBe("invalid_request");
+    expect(repos.oAuthCode.save).not.toHaveBeenCalled();
+  });
+
+  it("rejects a redirect URI that is only a prefix of a registered one", async () => {
+    const { controller, repos } = mcpController();
+    const result: any = await controller.authorize({ body: { client_id: "pub1", redirect_uri: "https://claude.ai/api", response_type: "code", scope: "", code_challenge: challenge, code_challenge_method: "S256" } } as any, {} as any);
+    expect(result.obj.error).toBe("invalid_redirect_uri");
+    expect(repos.oAuthCode.save).not.toHaveBeenCalled();
+  });
+
+  it("exchanges a code for tokens with the matching code_verifier and no secret, form-encoded", async () => {
+    const { AuthenticatedUser } = jest.requireMock("../../auth/index");
+    AuthenticatedUser.getCombinedApiJwt.mockReturnValue("jwt");
+    const code = { id: "code1", code: "c0de", clientId: "pub1", userChurchId: "uc1", redirectUri: claudeCallback, scopes: "people:read", codeChallenge: challenge, codeChallengeMethod: "S256", expiresAt: new Date(Date.now() + 60000) };
+    const { controller, repos } = mcpController({ code });
+    const body = new URLSearchParams({ grant_type: "authorization_code", code: "c0de", client_id: "pub1", redirect_uri: claudeCallback, code_verifier: verifier, resource: "https://api.example/mcp" }).toString();
+    const result: any = await controller.token({ body } as any, {} as any);
+    expect(result.obj.access_token).toBe("jwt");
+    expect(result.obj.refresh_token).toBeTruthy();
+    expect(repos.oAuthCode.consume).toHaveBeenCalledWith("code1");
+  });
+
+  it("refuses the exchange when the code_verifier does not match", async () => {
+    const code = { id: "code1", code: "c0de", clientId: "pub1", userChurchId: "uc1", redirectUri: claudeCallback, scopes: "people:read", codeChallenge: challenge, codeChallengeMethod: "S256", expiresAt: new Date(Date.now() + 60000) };
+    const { controller, repos } = mcpController({ code });
+    const result: any = await controller.token({ body: { grant_type: "authorization_code", code: "c0de", client_id: "pub1", code_verifier: "x".repeat(43) } } as any, {} as any);
+    expect(result.status).toBe(400);
+    expect(result.obj.error).toBe("invalid_grant");
+    expect(repos.oAuthCode.consume).not.toHaveBeenCalled();
+  });
+});
+
+describe("OAuthController refresh rotation grace window (#1024)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  let seq = 0;
+
+  function refreshController(rows: any[]) {
+    const helpers = jest.requireMock("../../helpers/index");
+    helpers.UniqueIdHelper.secret = () => "rt" + (++seq);
+    const { AuthenticatedUser } = jest.requireMock("../../auth/index");
+    AuthenticatedUser.getCombinedApiJwt.mockReturnValue("jwt");
+    const repos: any = {
+      oAuthClient: { loadByClientIdAndSecret: jest.fn(async () => ({ clientId: "fp", name: "FreePlay", clientSecret: "s" })), loadByClientId: jest.fn(async () => null) },
+      userChurch: { load: jest.fn(async () => ({ id: "uc1", userId: "u1", churchId: "ch1", personId: "p1" })) },
+      user: { load: jest.fn(async () => ({ id: "u1", email: "a@b.c" })) },
+      church: { loadById: jest.fn(async () => ({ id: "ch1", name: "Grace", subDomain: "grace" })) },
+      person: { loadByIdsOnly: jest.fn(async () => [{ membershipStatus: "Member" }]) },
+      groupMember: { loadForPeople: jest.fn(async () => []) },
+      oAuthToken: {
+        loadByRefreshToken: jest.fn(async (rt: string) => rows.find((r) => r.refreshToken === rt) ?? null),
+        load: jest.fn(async (id: string) => rows.find((r) => r.id === id) ?? null),
+        save: jest.fn(async (t: any) => {
+          if (!t.id) { t.id = "tok" + (++seq); rows.push({ ...t }); return t; }
+          const i = rows.findIndex((r) => r.id === t.id);
+          rows[i] = { ...t };
+          return t;
+        }),
+        delete: jest.fn(async (id: string) => { const i = rows.findIndex((r) => r.id === id); if (i >= 0) rows.splice(i, 1); })
+      }
+    };
+    const controller = new OAuthController();
+    (controller as any).repos = repos;
+    (controller as any).actionWrapperAnon = (_req: any, _res: any, action: any) => action();
+    (controller as any).json = (obj: any, status: number = 200) => ({ obj, status });
+    const refresh = (rt: string) => controller.token({ body: { grant_type: "refresh_token", refresh_token: rt, client_id: "fp", client_secret: "s" } } as any, {} as any) as any;
+    return { refresh, repos };
+  }
+
+  const tvToken = () => ({ id: "tv0", clientId: "fp", userChurchId: "uc1", refreshToken: "old", scopes: "plans", planTypeId: "pt1", expiresAt: new Date(Date.now() + 80 * DAY) });
+
+  afterEach(() => jest.useRealTimers());
+
+  it("keeps the old refresh token for a short grace window instead of deleting it", async () => {
+    const rows = [tvToken()];
+    const { refresh } = refreshController(rows);
+    const result = await refresh("old");
+    expect(result.status).toBe(200);
+    expect(result.obj.refresh_token).not.toBe("old");
+    const old = rows.find((r) => r.id === "tv0");
+    expect(old).toBeTruthy();
+    expect(old.replacedById).toBe(rows.find((r) => r.refreshToken === result.obj.refresh_token).id);
+    expect(new Date(old.expiresAt).getTime()).toBeLessThanOrEqual(Date.now() + 7 * DAY + 1000);
+  });
+
+  it("lets a TV that missed the rotation reply refresh again with its old token and keeps the plan type", async () => {
+    const rows = [tvToken()];
+    const { refresh } = refreshController(rows);
+    const lost = await refresh("old");
+    const retry = await refresh("old");
+    expect(retry.status).toBe(200);
+    expect(retry.obj.plan_type_id).toBe("pt1");
+    expect(retry.obj.refresh_token).not.toBe(lost.obj.refresh_token);
+    // The reply that never arrived does not linger as a second live connection.
+    expect(rows.find((r) => r.refreshToken === lost.obj.refresh_token)).toBeUndefined();
+    expect(rows.filter((r) => !r.replacedById)).toHaveLength(1);
+    const next = await refresh(retry.obj.refresh_token);
+    expect(next.status).toBe(200);
+  });
+
+  it("refuses the old token once the token that replaced it has been used", async () => {
+    const rows = [tvToken()];
+    const { refresh } = refreshController(rows);
+    const first = await refresh("old");
+    await refresh(first.obj.refresh_token);
+    const replay = await refresh("old");
+    expect(replay.status).toBe(400);
+    expect(replay.obj.error).toBe("invalid_grant");
+  });
+
+  it("refuses the old token after the grace window", async () => {
+    const rows = [tvToken()];
+    const { refresh } = refreshController(rows);
+    await refresh("old");
+    jest.useFakeTimers({ now: Date.now() + 8 * DAY });
+    const late = await refresh("old");
+    expect(late.status).toBe(400);
+    expect(late.obj.error).toBe("invalid_grant");
+  });
+
+  it("revokes the rotated tokens along with the connection", async () => {
+    const repos: any = {
+      oAuthToken: { load: jest.fn(async () => ({ id: "tok2", userChurchId: "uc1" })), delete: jest.fn(), deleteWithPredecessors: jest.fn() },
+      userChurch: { loadByUserId: jest.fn(async () => ({ id: "uc1" })) }
+    };
+    const controller = new OAuthController();
+    (controller as any).repos = repos;
+    (controller as any).actionWrapper = (_req: any, _res: any, action: any) => action({ id: "u1", churchId: "ch1", checkAccess: () => true });
+    (controller as any).json = (obj: any, status: number = 200) => ({ obj, status });
+    const result: any = await controller.deleteConnection("tok2", {} as any, {} as any);
+    expect(result.status).toBe(200);
+    expect(repos.oAuthToken.deleteWithPredecessors).toHaveBeenCalledWith("tok2");
+  });
+
+  it("still refuses a refresh token past its own expiry", async () => {
+    const rows = [{ ...tvToken(), expiresAt: new Date(Date.now() - DAY) }];
+    const { refresh } = refreshController(rows);
+    const result = await refresh("old");
+    expect(result.status).toBe(400);
+    expect(result.obj.error).toBe("invalid_grant");
+  });
+});
+
+describe("OAuthController device authorization client check", () => {
+  function deviceAuthController(client: any) {
+    const repos: any = {
+      oAuthClient: { loadByClientId: jest.fn(async () => client) },
+      oAuthDeviceCode: { save: jest.fn(async (d: any) => d) }
+    };
+    const controller = new OAuthController();
+    (controller as any).repos = repos;
+    (controller as any).actionWrapperAnon = (_req: any, _res: any, action: any) => action();
+    (controller as any).json = (obj: any, status: number = 200) => ({ obj, status });
+    return { controller, repos };
+  }
+
+  it("refuses device codes for self-registered clients, which only sign in with a code and PKCE", async () => {
+    const { controller, repos } = deviceAuthController({ id: "cl1", clientId: "pub1", name: "Church TV", clientSecret: null, redirectUris: "https://claude.ai/api/mcp/auth_callback", selfRegistered: 1 });
+    const result: any = await (controller as any).deviceAuthorize({ body: { client_id: "pub1" } }, {});
+    expect(result.status).toBe(400);
+    expect(result.obj.error).toBe("invalid_client");
+    expect(repos.oAuthDeviceCode.save).not.toHaveBeenCalled();
+  });
+
+  it("still issues device codes for clients we registered", async () => {
+    const { controller, repos } = deviceAuthController({ id: "cl2", clientId: "freeplay", name: "FreePlay", clientSecret: "s", redirectUris: "", selfRegistered: 0 });
+    const result: any = await (controller as any).deviceAuthorize({ body: { client_id: "freeplay" } }, {});
+    expect(result.obj.device_code).toBe("dc");
+    expect(repos.oAuthDeviceCode.save).toHaveBeenCalled();
   });
 });

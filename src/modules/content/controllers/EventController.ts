@@ -17,7 +17,9 @@ export class EventController extends ContentBaseController {
   public async getPostsForGroup(@requestParam("groupId") groupId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       const eventIds = req.query.eventIds ? req.query.eventIds.toString().split(",") : [];
-      return await this.repos.event.loadTimelineGroup(au.churchId, groupId, au.groupIds || [], eventIds);
+      const result = await this.repos.event.loadTimelineGroup(au.churchId, groupId, au.groupIds || [], eventIds);
+      await CalendarHelper.addExceptionDates(result, this.repos);
+      return await this.dropRemovedGroupEvents(au.churchId, result);
     });
   }
 
@@ -25,7 +27,9 @@ export class EventController extends ContentBaseController {
   public async getPosts(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       const eventIds = req.query.eventIds ? req.query.eventIds.toString().split(",") : [];
-      return await this.repos.event.loadTimeline(au.churchId, au.groupIds || [], eventIds);
+      const result = await this.repos.event.loadTimeline(au.churchId, au.groupIds || [], eventIds);
+      await CalendarHelper.addExceptionDates(result, this.repos);
+      return await this.dropRemovedGroupEvents(au.churchId, result);
     });
   }
 
@@ -41,12 +45,17 @@ export class EventController extends ContentBaseController {
   public async getMyRequests(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       const events = await this.repos.event.loadRequestsForPerson(au.churchId, au.personId);
-      const result = [];
-      for (const event of events) {
-        const bookings = await this.repos.eventBooking.loadForEvent(au.churchId, event.id);
-        result.push({ ...event, bookings });
-      }
-      return result;
+      return await this.attachBookings(au.churchId, events);
+    });
+  }
+
+  // #1476: a person's event/room requests for their record, gated like the approvals inbox.
+  @httpGet("/requests/person/:personId")
+  public async getRequestsForPerson(@requestParam("personId") personId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!au.checkAccess(Permissions.content.edit) && !au.checkAccess(Permissions.calendars.admin)) return this.json({}, 401);
+      const events = await this.repos.event.loadRequestsForPerson(au.churchId, personId);
+      return await this.attachBookings(au.churchId, events);
     });
   }
 
@@ -55,6 +64,14 @@ export class EventController extends ContentBaseController {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.content.edit) && !au.checkAccess(Permissions.calendars.admin)) return this.json({}, 401);
       return await this.repos.event.loadPendingApproval(au.churchId);
+    });
+  }
+
+  @httpGet("/resolved")
+  public async getResolved(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!au.checkAccess(Permissions.content.edit) && !au.checkAccess(Permissions.calendars.admin)) return this.json({}, 401);
+      return await this.repos.event.loadResolved(au.churchId);
     });
   }
 
@@ -216,7 +233,7 @@ export class EventController extends ContentBaseController {
   // Pre-save conflict check for a proposed event + room/resource bookings.
   // authz-exempt: self-service — read-only conflict check over data scoped to au.churchId
   @httpPost("/conflicts")
-  public async conflicts(req: express.Request<{}, {}, ProposedBooking>, res: express.Response): Promise<any> {
+  public async conflicts(req: express.Request<{}, {}, ProposedBooking & { timeZone?: string }>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
       const proposed: ProposedBooking = {
         eventId: req.body.eventId,
@@ -233,7 +250,8 @@ export class EventController extends ContentBaseController {
       const { windowStart, windowEnd } = ConflictHelper.computeWindow(proposed.start);
       const resourceIds = proposed.resources.map((r) => r.resourceId);
       const church = await getMembershipModuleGateway().loadChurch(au.churchId);
-      const timeZone = church?.timeZone;
+      // Without a church time zone, word the warnings in the browser's zone so they match the rest of the page.
+      const timeZone = church?.timeZone || req.body.timeZone;
 
       return ConflictHelper.findConflicts(proposed, {
         windowStart,
@@ -321,7 +339,9 @@ export class EventController extends ContentBaseController {
       const existing = await this.repos.event.load(au.churchId, id);
       // CA-1: a requester may withdraw their own still-pending request.
       const isSelfCancel = !!existing && existing.requestedBy === au.personId && existing.approvalStatus === "pending";
-      if (!au.checkAccess(Permissions.content.edit) && !isSelfCancel) return this.json({}, 401);
+      const hasStaffAccess = au.checkAccess(Permissions.content.edit) || au.checkAccess(Permissions.calendars.admin);
+      const isGroupLeader = !!existing?.groupId && !!au.leaderGroupIds?.includes(existing.groupId);
+      if (!hasStaffAccess && !isGroupLeader && !isSelfCancel) return this.json({}, 401);
       else {
         await this.repos.event.delete(au.churchId, id);
         await this.repos.eventBooking.deleteForEvent(au.churchId, id);
@@ -338,16 +358,34 @@ export class EventController extends ContentBaseController {
       if (!event) return this.json({}, 404);
       event.approvalStatus = status;
       if (status === "approved") event.visibility = "public";
+      else if (status === "rejected") event.visibility = "private";
       const result = await this.repos.event.save(event);
       if (event.requestedBy) {
         try {
-          await NotificationService.createNotifications([event.requestedBy], au.churchId, "event", event.id, `Your event request "${event.title}" was ${status}.`);
+          await NotificationService.createNotifications([event.requestedBy], au.churchId, "event", event.id, `Your event request "${event.title}" was ${status}.`, "/mobile/myRequests");
         } catch (e) {
           console.error("[EventController] Failed to notify event requester:", e);
         }
       }
       return result;
     });
+  }
+
+  // A stale JWT or a curated calendar can still reference a deleted (soft-removed) group (#1324).
+  private async dropRemovedGroupEvents(churchId: string, events: Event[]) {
+    const groupIds = [...new Set(events.filter((e) => e.groupId).map((e) => e.groupId))];
+    if (groupIds.length === 0) return events;
+    const activeIds = new Set(await getMembershipModuleGateway().loadActiveGroupIds(churchId, groupIds));
+    return events.filter((e) => !e.groupId || activeIds.has(e.groupId));
+  }
+
+  private async attachBookings(churchId: string, events: Event[]) {
+    const result = [];
+    for (const event of events) {
+      const bookings = await this.repos.eventBooking.loadForEvent(churchId, event.id);
+      result.push({ ...event, bookings });
+    }
+    return result;
   }
 
   private async saveBookingsForEvent(au: any, eventId: string, roomIds: string[], resources: { resourceId: string; quantity: number }[]): Promise<EventBooking[]> {

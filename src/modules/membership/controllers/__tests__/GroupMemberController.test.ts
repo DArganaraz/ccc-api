@@ -1,7 +1,7 @@
 import "reflect-metadata";
 jest.mock("../MembershipBaseController", () => ({ MembershipBaseController: class { json(obj: any, status: number) { return { obj, status }; } } }));
 jest.mock("../../helpers/index", () => ({
-  Permissions: { groupMembers: { view: "gmView", edit: "gmEdit" } },
+  Permissions: { groupMembers: { view: "gmView", edit: "gmEdit" }, attendance: { view: "attView", edit: "attEdit" } },
   UserChurchHelper: { createForGroupMember: jest.fn() }
 }));
 jest.mock("../../models/requests", () => ({}));
@@ -82,6 +82,63 @@ describe("GroupMemberController.getAll roster contact privacy", () => {
     const result = await (controller as any).getAll({ query: { groupId: "g1" } }, {});
     expect(result.status).toBe(401);
     expect(repos.groupMember.loadForGroup).not.toHaveBeenCalled();
+  });
+
+  // #1294: groupIds in the login token are stale for a group joined after sign-in.
+  it("lets a member who joined after sign-in see the roster (live membership check)", async () => {
+    const { controller, repos } = gmController({ groupIds: [], rows: [rosterRow("p2")] });
+    repos.groupMember.loadForPerson = jest.fn(async () => [{ groupId: "g1", personId: "p1" }]);
+    const result = await (controller as any).getAll({ query: { groupId: "g1" } }, {});
+    expect(result).toHaveLength(1);
+    expect(repos.groupMember.loadForPerson).toHaveBeenCalledWith("c1", "p1");
+  });
+
+  it("applies the live membership check to groupIds too", async () => {
+    const { controller, repos } = gmController({ groupIds: ["g1"], rows: [rosterRow("p2", "g1"), rosterRow("p3", "g2")] });
+    repos.groupMember.loadForPerson = jest.fn(async () => [{ groupId: "g1" }, { groupId: "g2" }]);
+    const result = await (controller as any).getAll({ query: { groupIds: "g1,g2" } }, {});
+    expect(result).toHaveLength(2);
+  });
+
+  it("still blocks when the live check finds no membership either (401)", async () => {
+    const { controller, repos } = gmController({ groupIds: [] });
+    repos.groupMember.loadForPerson = jest.fn(async () => [{ groupId: "other" }]);
+    const result = await (controller as any).getAll({ query: { groupIds: "g1,other" } }, {});
+    expect(result.status).toBe(401);
+    expect(repos.groupMember.loadForGroups).not.toHaveBeenCalled();
+  });
+
+  // #1308: attendance View/Edit can read a class roster without being a member.
+  it("lets an attendance taker who is not a member load names, including minors, with contacts stripped", async () => {
+    const child = { ...rosterRow("kid"), birthDate: "2018-03-10" };
+    const adult = { ...rosterRow("adult"), birthDate: "1980-01-01" };
+    const { controller, repos } = gmController({ groupIds: [], access: ["attView"] });
+    repos.groupMember.loadForPerson = jest.fn(async () => []);
+    repos.groupMember.loadForGroup = jest.fn(async () => [child, adult]);
+    const result = await (controller as any).getAll({ query: { groupId: "g1" } }, {});
+    expect(repos.groupMember.loadForGroup).toHaveBeenCalledWith("c1", "g1");
+    expect(result.map((r: any) => r.personId).sort()).toEqual(["adult", "kid"]);
+    result.forEach((gm: any) => {
+      expect(gm.person.name.display).toBeDefined();
+      expect(gm.person.contactInfo).toBeUndefined();
+      expect(gm.person.householdId).toBeUndefined();
+    });
+  });
+
+  it("still hides a confidential group from an attendance taker who is not a member", async () => {
+    const { controller, repos } = gmController({ groupIds: [], access: ["attEdit"], group: { id: "g1", confidential: true } });
+    repos.groupMember.loadForPerson = jest.fn(async () => []);
+    const result = await (controller as any).getAll({ query: { groupId: "g1" } }, {});
+    expect(result.status).toBe(401);
+    expect(repos.groupMember.loadForGroup).not.toHaveBeenCalled();
+  });
+
+  it("still hides known minors from an ordinary member", async () => {
+    const child = { ...rosterRow("kid"), birthDate: new Date().toISOString() };
+    const adult = { ...rosterRow("adult"), birthDate: "1980-01-01" };
+    const { controller } = gmController({ groupIds: ["g1"], rows: [child, adult] });
+    const result = await (controller as any).getAll({ query: { groupId: "g1" } }, {});
+    expect(result.map((r: any) => r.personId)).toEqual(["adult"]);
   });
 });
 

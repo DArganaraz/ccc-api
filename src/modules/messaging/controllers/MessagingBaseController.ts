@@ -23,6 +23,50 @@ export class MessagingBaseController extends BaseController {
       : au.checkAccess(Permissions.people.edit);
   }
 
+  // Leader-only notes on a group (ChurchAppsSupport#1199). Not a feed: members and staff never see them.
+  protected isGroupNote(contentType?: string) {
+    return contentType === "groupNote";
+  }
+
+  protected canUseGroupNotes(au: any, groupId?: string) {
+    return !!groupId && !!au?.leaderGroupIds?.includes(groupId);
+  }
+
+  protected isEventNote(contentType?: string) {
+    return contentType === "eventNote";
+  }
+
+  // Each event picks who may view and who may post its notes: staff (default), the event group's
+  // leaders, or all its members. Calendar staff always qualify.
+  protected async canUseEventNotes(au: any, eventId: string | undefined, mode: "view" | "post"): Promise<boolean> {
+    if (!eventId || !au?.churchId) return false;
+    if (au.checkAccess(Permissions.content.edit) || au.checkAccess(Permissions.calendars.admin)) return true;
+    const { getContentModuleGateway } = await import("../../../shared/modules/ContentModuleGateway.js");
+    const event = await getContentModuleGateway().loadEvent(au.churchId, eventId);
+    return this.eventRoleAllows(au, event, mode);
+  }
+
+  protected eventRoleAllows(au: any, event: any, mode: "view" | "post"): boolean {
+    if (!event?.groupId) return false;
+    const role = (mode === "view" ? event.notesViewRole : event.notesPostRole) || "staff";
+    const isLeader = !!au.leaderGroupIds?.includes(event.groupId);
+    if (role === "leaders") return isLeader;
+    if (role === "members") return isLeader || !!au.groupIds?.includes(event.groupId);
+    return false;
+  }
+
+  protected isNote(contentType?: string) {
+    return this.isPersonNote(contentType) || this.isGroupNote(contentType) || this.isEventNote(contentType);
+  }
+
+  // Read/post gate shared by every note type.
+  protected async canUseNotes(au: any, conv: { contentType?: string; contentId?: string }, mode: "view" | "post"): Promise<boolean> {
+    if (this.isPersonNote(conv.contentType)) return this.canViewPersonNotes(au, conv.contentType);
+    if (this.isGroupNote(conv.contentType)) return this.canUseGroupNotes(au, conv.contentId);
+    if (this.isEventNote(conv.contentType)) return this.canUseEventNotes(au, conv.contentId, mode);
+    return false;
+  }
+
   protected isAnonPublicConversation(conv: { contentType?: string; allowAnonymousPosts?: boolean; visibility?: string }) {
     return !!conv
       && PUBLIC_ANON_CONTENT_TYPES.has(conv.contentType || "")
@@ -66,24 +110,42 @@ export class MessagingBaseController extends BaseController {
     return this.isAuthenticated(au) && !!churchId && au.churchId === churchId;
   }
 
+  // Content-type level gate for routes that authorize before the conversation row exists (or before it
+  // is loaded). Mirrors canReadConversation minus the row-level checks.
+  protected async canReadContent(au: any, contentType: string, contentId: string): Promise<boolean> {
+    if (this.isNote(contentType)) return this.canUseNotes(au, { contentType, contentId }, "view");
+    if (au?.checkAccess(Permissions.content.edit)) return true;
+    if (contentType === "group" || contentType === "groupAnnouncement") {
+      return !!contentId && (!!au?.groupIds?.includes(contentId) || !!au?.leaderGroupIds?.includes(contentId));
+    }
+    if (contentType === "streamingLiveHost") return !!au?.checkAccess(Permissions.chat.host);
+    if (contentType === "workflowCard") return this.canUseWorkflowCard(au, contentId);
+    return true;
+  }
+
   // Single read gate for every messaging route: anonymous public livestream rooms are open, person
   // notes run through the notes RBAC, and everything else needs same-church plus the per-type rule.
   protected async canReadConversation(au: any, conv: any): Promise<boolean> {
     if (!conv) return false;
     if (this.isAnonPublicConversation(conv)) return true;
     if (!this.isSameChurch(au, conv.churchId)) return false;
-    if (this.isPersonNote(conv.contentType)) return this.canViewPersonNotes(au, conv.contentType);
+    if (this.isNote(conv.contentType)) return this.canUseNotes(au, conv, "view");
     if (au.checkAccess(Permissions.content.edit)) return true;
     if (conv.contentType === "group" || conv.contentType === "groupAnnouncement") {
       return !!conv.contentId && (!!au.groupIds?.includes(conv.contentId) || !!au.leaderGroupIds?.includes(conv.contentId));
     }
     if (conv.contentType === "streamingLiveHost") return !!au.checkAccess(Permissions.chat.host);
-    if (conv.contentType === "privateMessage") {
-      const pm = (await this.repos.privateMessage.loadById(au.churchId, conv.contentId)) as any;
-      return !!pm && (pm.fromPersonId === au.personId || pm.toPersonId === au.personId);
-    }
+    if (conv.contentType === "privateMessage") return this.isPrivateMessageParticipant(au, conv);
     if (conv.contentType === "workflowCard") return this.canUseWorkflowCard(au, conv.contentId);
     return true;
+  }
+
+  // Clients set a DM conversation's contentId to a person id, not the privateMessages row id, so find the
+  // pair by the conversation itself; fall back to contentId for rows that were keyed that way.
+  protected async isPrivateMessageParticipant(au: any, conv: any): Promise<boolean> {
+    const pm = ((conv.id ? await this.repos.privateMessage.loadByConversationId(au.churchId, conv.id) : null)
+      ?? (conv.contentId ? await this.repos.privateMessage.loadById(au.churchId, conv.contentId) : null)) as any;
+    return !!pm && (pm.fromPersonId === au.personId || pm.toPersonId === au.personId);
   }
 
   // Card notes: anyone who can open the card (tasks.view, or tied to it as person or group) can read and write on it.
