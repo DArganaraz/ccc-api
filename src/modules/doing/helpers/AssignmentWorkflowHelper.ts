@@ -7,13 +7,17 @@ import { ScreenScheduleHelper } from "./ScreenScheduleHelper.js";
 import { NotificationService } from "../../../shared/helpers/NotificationService.js";
 import { WorkflowHelper } from "./WorkflowHelper.js";
 import { StepActionHelper } from "./StepActionHelper.js";
+import { AppUrlHelper } from "../../../shared/helpers/AppUrlHelper.js";
+import { CardData, StepActionConfig } from "./CardData.js";
 
+// A plan or workflow that cannot issue requests is the caller's to fix: answer 400, not 500.
+const badRequest = (message: string) => Object.assign(new Error(message), { status: 400 });
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
 
 export class AssignmentWorkflowHelper {
   public static readonly workflowType = "assignmentConfirmation";
 
-  public static data(task: Task): Record<string, any> {
+  public static data(task: Task): CardData {
     try { return JSON.parse(task.data || "{}") || {}; } catch { return {}; }
   }
 
@@ -21,10 +25,10 @@ export class AssignmentWorkflowHelper {
   // command binds the workflow before delivery; a timer repairs a failed card start.
   public static async issuePlan(churchId: string, planId: string, repos: Repos): Promise<{ issued: number }> {
     const plan = await repos.plan.load(churchId, planId) as Plan;
-    if (!plan || plan.prepared) throw new Error("Publish the plan before issuing requests");
-    if (!plan.confirmationWorkflowId) throw new Error("Select a confirmation workflow first");
+    if (!plan || plan.prepared) throw badRequest("Publish the plan before issuing requests");
+    if (!plan.confirmationWorkflowId) throw badRequest("Select a confirmation workflow first");
     await this.validateWorkflow(churchId, plan.confirmationWorkflowId, repos);
-    if (await this.expired(churchId, plan, repos)) throw new Error("The response deadline has passed");
+    if (await this.expired(churchId, plan, repos)) throw badRequest("The response deadline has passed");
     let issued = 0;
     for (const assignment of await repos.assignment.loadByPlanId(churchId, planId) as Assignment[]) {
       if (assignment.status !== "Unconfirmed" || assignment.notified) continue;
@@ -37,8 +41,8 @@ export class AssignmentWorkflowHelper {
 
   public static async validateWorkflow(churchId: string, workflowId: string, repos: Repos): Promise<void> {
     const workflow = await repos.workflow.load(churchId, workflowId) as Workflow;
-    if (!workflow?.active || workflow.workflowType !== this.workflowType) throw new Error("Choose an active assignment confirmation workflow from this church");
-    if (!(await repos.workflowStep.loadForWorkflow(churchId, workflowId) as WorkflowStep[]).length) throw new Error("The confirmation workflow needs a step");
+    if (!workflow?.active || workflow.workflowType !== this.workflowType) throw badRequest("Choose an active assignment confirmation workflow from this church");
+    if (!(await repos.workflowStep.loadForWorkflow(churchId, workflowId) as WorkflowStep[]).length) throw badRequest("The confirmation workflow needs a step");
   }
 
   public static async start(churchId: string, assignmentId: string, repos: Repos): Promise<void> {
@@ -235,14 +239,16 @@ export class AssignmentWorkflowHelper {
 
   // Existing event bus gives prompt termination; the existing 30-minute workflow
   // timer is the repair path for missed events, indirect removals, and starts.
-  public static async onEvent(churchId: string, event: string, payload: any): Promise<void> {
+  public static async onEvent(churchId: string, event: string, payload: unknown): Promise<void> {
     if (!["assignment.updated", "assignment.destroyed", "plan.updated", "plan.destroyed"].includes(event)) return;
     const repos = await RepoManager.getRepos<Repos>("doing");
+    // Bus payload is the changed Assignment or Plan row.
+    const record = payload as { id?: string };
     if (event.startsWith("assignment.")) {
-      await this.reconcileAssignment(churchId, payload.id, repos);
+      await this.reconcileAssignment(churchId, record.id, repos);
     } else {
       for (const card of await repos.task.loadOpenAssignmentCards(churchId) as Task[]) {
-        if (this.data(card).assignment?.planId === payload.id) await this.reconcileAssignment(churchId, card.assignmentId, repos);
+        if (this.data(card).assignment?.planId === record.id) await this.reconcileAssignment(churchId, card.assignmentId, repos);
       }
     }
   }
@@ -285,7 +291,7 @@ export class AssignmentWorkflowHelper {
     return cards.length;
   }
 
-  public static async send(task: Task, config: Record<string, any>, repos: Repos): Promise<void> {
+  public static async send(task: Task, config: StepActionConfig, repos: Repos): Promise<void> {
     if (!task.assignmentId) { StepActionHelper.appendHistory(task, "Serving message skipped: card has no assignment"); return; }
     const assignment = await repos.assignment.load(task.churchId, task.assignmentId) as Assignment;
     const position = await repos.position.load(task.churchId, assignment.positionId) as Position;
@@ -294,7 +300,7 @@ export class AssignmentWorkflowHelper {
     const person = await membership.loadPerson(task.churchId, assignment.personId);
     const church = await membership.loadChurch(task.churchId);
     if (!person) { StepActionHelper.appendHistory(task, "Serving message skipped: person removed"); return; }
-    const planUrl = `https://${church?.subDomain || "app"}.b1.church/mobile/plans/${plan.id}`;
+    const planUrl = AppUrlHelper.b1AppUrl(church?.subDomain || "app") + `/mobile/plans/${plan.id}`;
     const serviceDate = DateHelper.toMysqlDateOnly(plan.serviceDate);
     const summary = `${plan.name} · ${position.name} · ${serviceDate}`;
     const message = (config.message || "Please accept or decline your serving request.")

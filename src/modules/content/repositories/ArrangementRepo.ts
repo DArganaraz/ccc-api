@@ -23,7 +23,7 @@ export class ArrangementRepo {
       meter: model.meter,
       sequence: model.sequence,
       freeShowId: model.freeShowId
-    } as any).execute();
+    }).execute();
     return model;
   }
 
@@ -38,7 +38,7 @@ export class ArrangementRepo {
       meter: model.meter,
       sequence: model.sequence,
       freeShowId: model.freeShowId
-    } as any).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
+    }).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
     return model;
   }
 
@@ -51,30 +51,38 @@ export class ArrangementRepo {
   }
 
   public async loadAll(churchId: string): Promise<Arrangement[]> {
-    return getDb().selectFrom("arrangements").selectAll().where("churchId", "=", churchId).orderBy("name").execute() as any;
+    return getDb().selectFrom("arrangements").selectAll().where("churchId", "=", churchId).orderBy("name").execute();
   }
 
   public async loadBySongId(churchId: string, songId: string): Promise<Arrangement[]> {
-    return getDb().selectFrom("arrangements").selectAll().where("churchId", "=", churchId).where("songId", "=", songId).execute() as any;
+    return getDb().selectFrom("arrangements").selectAll().where("churchId", "=", churchId).where("songId", "=", songId).execute();
+  }
+
+  // The three lookups below feed the FreeShow sync. They skip arrangements whose song row is
+  // gone: older song deletes left those behind, and counting them made the sync treat deleted
+  // songs as already uploaded so they never came back (FreeShow#3999).
+  private withLiveSong() {
+    return getDb().selectFrom("arrangements as a")
+      .innerJoin("songs as s", (join) => join.onRef("s.id", "=", "a.songId").onRef("s.churchId", "=", "a.churchId"));
   }
 
   public async loadBySongDetailId(churchId: string, songDetailId: string) {
-    return getDb().selectFrom("arrangements").selectAll().where("churchId", "=", churchId).where("songDetailId", "=", songDetailId).execute() as any;
+    return this.withLiveSong().selectAll("a").where("a.churchId", "=", churchId).where("a.songDetailId", "=", songDetailId).execute();
   }
 
   public async loadByFreeShowId(churchId: string, freeShowId: string) {
-    return (await getDb().selectFrom("arrangements").selectAll().where("churchId", "=", churchId).where("freeShowId", "=", freeShowId).executeTakeFirst()) ?? null;
+    return (await this.withLiveSong().selectAll("a").where("a.churchId", "=", churchId).where("a.freeShowId", "=", freeShowId).executeTakeFirst()) ?? null;
   }
 
   public async loadFreeShowIds(churchId: string): Promise<string[]> {
-    const rows = await getDb().selectFrom("arrangements").select(["freeShowId"]).where("churchId", "=", churchId).where("freeShowId", "is not", null).execute();
-    return rows.map((r: any) => r.freeShowId).filter((id: string) => id);
+    const rows = await this.withLiveSong().select(["a.freeShowId"]).where("a.churchId", "=", churchId).where("a.freeShowId", "is not", null).execute();
+    return rows.map((r) => r.freeShowId).filter((id: string) => id);
   }
 
-  public convertToModel(_churchId: string, data: any) { return data as Arrangement; }
-  public convertAllToModel(_churchId: string, data: any[]) { return (data || []) as Arrangement[]; }
+  public convertToModel(_churchId: string, data: Arrangement) { return data; }
+  public convertAllToModel(_churchId: string, data: Arrangement[]) { return data || []; }
 
-  protected rowToModel(row: any): Arrangement {
+  protected rowToModel(row: Arrangement): Arrangement {
     return {
       id: row.id,
       churchId: row.churchId,

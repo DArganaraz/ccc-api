@@ -1,10 +1,11 @@
-import { controller, httpPost, httpGet, requestParam } from "inversify-express-utils";
+import { controller, httpPost, httpGet, httpDelete, requestParam } from "inversify-express-utils";
 import express from "express";
+import { AuthenticatedUser } from "@churchapps/apihelper";
 import { DoingBaseController } from "./DoingBaseController.js";
 import { AssignmentWorkflowHelper } from "../helpers/AssignmentWorkflowHelper.js";
 import { StepActionHelper } from "../helpers/StepActionHelper.js";
 import { Task } from "../models/index.js";
-import { WorkflowHelper, DirectoryUpdateHelper, AccountDeletionHelper } from "../helpers/index.js";
+import { WorkflowHelper, DirectoryUpdateHelper, AccountDeletionHelper, HouseholdEditHelper } from "../helpers/index.js";
 import { Permissions, TaskAuth } from "../../../shared/helpers/index.js";
 import { InternalEventBus } from "../../../shared/events/InternalEventBus.js";
 import { getMembershipModuleGateway, getMessagingModuleGateway } from "../../../shared/modules/index.js";
@@ -12,7 +13,7 @@ import { getMembershipModuleGateway, getMessagingModuleGateway } from "../../../
 @controller("/doing/tasks")
 export class TaskController extends DoingBaseController {
   @httpGet("/timeline")
-  public async getTimeline(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getTimeline(req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       const taskIds = typeof req.query.taskIds === "string" ? req.query.taskIds.split(",") : req.query.taskIds ? [String(req.query.taskIds)] : [];
       const rows = (await this.repos.task.loadTimeline(au.churchId, au.personId, taskIds)) as Task[];
@@ -21,14 +22,14 @@ export class TaskController extends DoingBaseController {
   }
 
   @httpGet("/closed")
-  public async getForPersonClosed(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getForPersonClosed(req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       return await this.repos.task.loadForPerson(au.churchId, au.personId, "Closed");
     });
   }
 
   @httpGet("/directoryUpdate/:personId")
-  public async getPersonDirectoryUpdate(@requestParam("personId") personId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getPersonDirectoryUpdate(@requestParam("personId") personId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (personId !== au.personId && !au.checkAccess(Permissions.tasks.view)) return this.json({}, 401);
       return await this.repos.task.loadForDirectoryUpdate(au.churchId, personId);
@@ -36,7 +37,7 @@ export class TaskController extends DoingBaseController {
   }
 
   @httpGet("/board/:workflowId")
-  public async getBoard(@requestParam("workflowId") workflowId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getBoard(@requestParam("workflowId") workflowId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.tasks.view)) return this.json({}, 401);
       const [workflow, steps, cards, routes, actions] = await Promise.all([
@@ -51,14 +52,14 @@ export class TaskController extends DoingBaseController {
   }
 
   @httpGet("/cards/my")
-  public async getMyCards(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getMyCards(req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       return await this.repos.task.loadCardsForPerson(au.churchId, au.personId, "Open");
     });
   }
 
   @httpGet("/:id")
-  public async get(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async get(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       const task = (await this.repos.task.load(au.churchId, id)) as Task;
       if (task && !this.canViewTask(au, task)) return this.json({}, 401);
@@ -68,7 +69,7 @@ export class TaskController extends DoingBaseController {
 
   // Contact info for the person a card is about, scoped to anyone who can view the card (e.g. the assigned caller without People access).
   @httpGet("/:id/contact")
-  public async getContact(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getContact(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       const task = (await this.repos.task.load(au.churchId, id)) as Task;
       if (!task) return {};
@@ -80,19 +81,19 @@ export class TaskController extends DoingBaseController {
     });
   }
 
-  private canViewTask(au: { personId?: string; groupIds?: string[]; checkAccess: (p: any) => boolean }, task: Task): boolean {
+  private canViewTask(au: AuthenticatedUser, task: Task): boolean {
     return TaskAuth.canViewTask(au, task);
   }
 
   @httpGet("/")
-  public async getForPerson(req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async getForPerson(req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       return await this.repos.task.loadForPerson(au.churchId, au.personId, "Open");
     });
   }
 
   @httpPost("/loadForGroups")
-  public async loadForGroups(req: express.Request<{}, {}, { groupIds: string[]; status: string }>, res: express.Response): Promise<any> {
+  public async loadForGroups(req: express.Request<{}, {}, { groupIds: string[]; status: string }>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.tasks.view)) return this.json({}, 401);
       return await this.repos.task.loadForGroups(au.churchId, req.body.groupIds, req.body.status);
@@ -100,7 +101,7 @@ export class TaskController extends DoingBaseController {
   }
 
   @httpPost("/")
-  public async save(req: express.Request<{}, {}, Task[]>, res: express.Response): Promise<any> {
+  public async save(req: express.Request<{}, {}, Task[]>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       const type = req.query?.type;
       // Member directory updates and account deletion requests are self-service; staff task creation requires Edit.
@@ -124,22 +125,33 @@ export class TaskController extends DoingBaseController {
       const result: Task[] = [];
       const memberDirectoryUpdate = type === "directoryUpdate" && !au.checkAccess(Permissions.tasks.edit);
       if (memberDirectoryUpdate && req.body.some((task) => task.id)) return this.json({}, 401);
+      // A member's request about someone else is a household edit: checked and shaped before anything is saved.
+      const householdEdits = new Set<Task>();
+      if (memberDirectoryUpdate) {
+        for (const task of req.body) {
+          if (!task.associatedWithId || task.associatedWithId === au.personId) continue;
+          const prepared = await HouseholdEditHelper.prepareRequest(au, task);
+          if (prepared.status) return this.json(prepared.error ? { message: prepared.error } : {}, prepared.status);
+          householdEdits.add(task);
+        }
+      }
       for (const task of req.body) {
-        if (memberDirectoryUpdate) {
+        if (memberDirectoryUpdate && !householdEdits.has(task)) {
           task.status = "Open";
           task.associatedWithType = "person";
           task.associatedWithId = au.personId;
           task.createdByType = "person";
           task.createdById = au.personId;
         }
+        let existing: Task | null = null;
         if (task.id) {
-          const existing = await this.repos.task.load(au.churchId, task.id);
+          existing = await this.repos.task.load(au.churchId, task.id) as Task;
           if (existing?.taskType === AccountDeletionHelper.taskType && existing.status !== "Closed" && task.status === "Closed") {
             return this.json({ message: "Account deletion requests must be decided from the review action" }, 400);
           }
         }
         if (task.id) {
-          const linked = await this.repos.task.load(au.churchId, task.id) as Task;
+          const linked = existing;
           if (linked?.assignmentId) {
             if (linked.workflowId) return this.json({ message: "Workflow cards must use the card endpoints" }, 400);
             const saved = await this.repos.task.withAssignmentLock(au.churchId, linked.assignmentId, async () => {
@@ -154,7 +166,7 @@ export class TaskController extends DoingBaseController {
                 assignedToType: task.assignedToType ?? linked.assignedToType,
                 assignedToId: task.assignedToId ?? linked.assignedToId,
                 assignedToLabel: task.assignedToLabel ?? linked.assignedToLabel,
-                dateClosed: task.status === "Closed" ? new Date() : linked.dateClosed
+                dateClosed: TaskController.closedDate(task.status ?? linked.status, linked, task.dateClosed)
               });
             });
             if (saved) {
@@ -167,6 +179,11 @@ export class TaskController extends DoingBaseController {
         if (task.assignmentId || task.followupKey) return this.json({ message: "Serving confirmation links are managed by the workflow" }, 400);
         task.churchId = au.churchId;
         if (type === "directoryUpdate") await DirectoryUpdateHelper.handleDirectoryUpdate(au.churchId, task);
+        if (existing && task.assignedToId !== undefined && task.assignedToId !== existing.assignedToId) {
+          task.data = task.data ?? existing.data;
+          StepActionHelper.appendHistory(task, `Reassigned from ${existing.assignedToLabel || "unassigned"} to ${task.assignedToLabel || "unassigned"}`);
+        }
+        if (existing && task.status) task.dateClosed = TaskController.closedDate(task.status, existing, task.dateClosed);
         const saved = await this.repos.task.save(task);
         await InternalEventBus.publish(au.churchId, "task.updated", saved);
         result.push(saved);
@@ -175,8 +192,29 @@ export class TaskController extends DoingBaseController {
     });
   }
 
+  // Reopening clears the close date (null, so the update writes NULL); closing stamps it once and later edits keep it.
+  private static closedDate(status: string, existing: Task, requested?: Date): Date | null {
+    if (status !== "Closed") return null;
+    if (existing.status === "Closed" && existing.dateClosed) return existing.dateClosed;
+    return requested ?? new Date();
+  }
+
+  // Hard delete of a plain task; workflow cards use /:id/remove and account deletion requests are decided, not deleted.
+  @httpDelete("/:id")
+  public async delete(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
+    return this.actionWrapper(req, res, async (au) => {
+      if (!au.checkAccess(Permissions.tasks.edit)) return this.json({}, 401);
+      const task = (await this.repos.task.load(au.churchId, id)) as Task;
+      if (!task) return this.json({}, 404);
+      if (task.taskType === AccountDeletionHelper.taskType) return this.json({ message: "Account deletion requests must be decided from the review action" }, 400);
+      if (task.workflowId) return this.json({ message: "Workflow cards must use the card endpoints" }, 400);
+      await this.repos.task.delete(au.churchId, id);
+      return {};
+    });
+  }
+
   @httpPost("/addToWorkflow")
-  public async addToWorkflow(req: express.Request<{}, {}, { workflowId: string; stepId?: string; associatedWith: { type?: string; id?: string; label?: string } }>, res: express.Response): Promise<any> {
+  public async addToWorkflow(req: express.Request<{}, {}, { workflowId: string; stepId?: string; associatedWith: { type?: string; id?: string; label?: string } }>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.tasks.edit)) return this.json({}, 401);
       const { workflowId, stepId, associatedWith } = req.body;
@@ -185,7 +223,7 @@ export class TaskController extends DoingBaseController {
   }
 
   @httpPost("/bulkAddToWorkflow")
-  public async bulkAddToWorkflow(req: express.Request<{}, {}, { workflowId: string; stepId?: string; people?: { id: string; label?: string }[]; listId?: string }>, res: express.Response): Promise<any> {
+  public async bulkAddToWorkflow(req: express.Request<{}, {}, { workflowId: string; stepId?: string; people?: { id: string; label?: string }[]; listId?: string }>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.tasks.edit)) return this.json({}, 401);
       const { workflowId, stepId, people } = req.body;
@@ -202,27 +240,28 @@ export class TaskController extends DoingBaseController {
 
   // authz-exempt: gated by bulkApply → canEditCard(au, task) per card (tasks.edit or assignee)
   @httpPost("/bulk/moveStep")
-  public async bulkMoveStep(req: express.Request<{}, {}, { ids: string[]; stepId: string }>, res: express.Response): Promise<any> {
+  public async bulkMoveStep(req: express.Request<{}, {}, { ids: string[]; stepId: string }>, res: express.Response): Promise<unknown> {
     return this.bulkApply(req, res, async (task) => ((await this.stepInCardWorkflow(task, req.body.stepId)) ? WorkflowHelper.moveToStep(task, req.body.stepId, this.repos, true) : null));
   }
 
   // authz-exempt: gated by bulkApply → canEditCard(au, task) per card (tasks.edit or assignee)
   @httpPost("/bulk/complete")
-  public async bulkComplete(req: express.Request<{}, {}, { ids: string[] }>, res: express.Response): Promise<any> {
+  public async bulkComplete(req: express.Request<{}, {}, { ids: string[] }>, res: express.Response): Promise<unknown> {
     return this.bulkApply(req, res, async (task) => WorkflowHelper.complete(task, this.repos));
   }
 
   // authz-exempt: gated by bulkApply → canEditCard(au, task) per card (tasks.edit or assignee)
   @httpPost("/bulk/reassign")
-  public async bulkReassign(req: express.Request<{}, {}, { ids: string[]; assignedToType?: string; assignedToId?: string; assignedToLabel?: string }>, res: express.Response): Promise<any> {
-    return this.bulkApply(req, res, async (task) =>
-      WorkflowHelper.reassign(task, { type: req.body.assignedToType, id: req.body.assignedToId, label: req.body.assignedToLabel }, this.repos));
+  public async bulkReassign(req: express.Request<{}, {}, { ids: string[]; assignedToType?: string; assignedToId?: string; assignedToLabel?: string }>, res: express.Response): Promise<unknown> {
+    return this.bulkApply(req, res, async (task, au) =>
+      WorkflowHelper.reassign(task, { type: req.body.assignedToType, id: req.body.assignedToId, label: req.body.assignedToLabel }, this.repos, au.personId));
   }
 
   // authz-exempt: gated by bulkApply → canEditCard(au, task) per card (tasks.edit or assignee)
   @httpPost("/bulk/snooze")
-  public async bulkSnooze(req: express.Request<{}, {}, { ids: string[]; days: number }>, res: express.Response): Promise<any> {
-    return this.bulkApply(req, res, async (task) => WorkflowHelper.snooze(task, req.body.days, this.repos));
+  public async bulkSnooze(req: express.Request<{}, {}, { ids: string[]; days?: number; until?: string }>, res: express.Response): Promise<unknown> {
+    const until = TaskController.snoozeUntil(req.body);
+    return this.bulkApply(req, res, async (task) => (until === null ? null : WorkflowHelper.snooze(task, until, this.repos)));
   }
 
   // Applies op to each editable card, reporting updated vs. skipped (missing/denied) ids.
@@ -232,7 +271,7 @@ export class TaskController extends DoingBaseController {
     return !!step && step.workflowId === task.workflowId;
   }
 
-  private async bulkApply(req: express.Request<{}, {}, { ids: string[] }>, res: express.Response, op: (task: Task) => Promise<Task | null>): Promise<any> {
+  private async bulkApply(req: express.Request<{}, {}, { ids: string[] }>, res: express.Response, op: (task: Task, au: AuthenticatedUser) => Promise<Task | null>): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       const ids = req.body.ids || [];
       const tasks = (await Promise.all(ids.map((id) => this.repos.task.load(au.churchId, id)))) as (Task | null)[];
@@ -244,7 +283,7 @@ export class TaskController extends DoingBaseController {
           skipped.push(ids[i]);
           continue;
         }
-        if ((await this.assignmentOperation(task, op)) === null) {
+        if ((await this.assignmentOperation(task, (t) => op(t, au))) === null) {
           skipped.push(ids[i]);
           continue;
         }
@@ -254,7 +293,7 @@ export class TaskController extends DoingBaseController {
     });
   }
 
-  private async assignmentOperation(task: Task, op: (task: Task) => Promise<Task | null>): Promise<Task | null> {
+  private async assignmentOperation<T>(task: Task, op: (task: Task) => Promise<T>): Promise<T | Task | null> {
     if (!task.assignmentId) return op(task);
     return this.repos.task.withAssignmentLock(task.churchId, task.assignmentId, async () => {
       const current = await this.repos.task.load(task.churchId, task.id) as Task;
@@ -264,18 +303,18 @@ export class TaskController extends DoingBaseController {
   }
 
   // Single-card analogue of bulkApply: load, enforce per-card edit permission, run op.
-  private async withCard(req: express.Request, res: express.Response, id: string, op: (task: Task) => Promise<any>): Promise<any> {
+  private async withCard(req: express.Request, res: express.Response, id: string, op: (task: Task, au: AuthenticatedUser) => Promise<unknown>): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       const task = (await this.repos.task.load(au.churchId, id)) as Task;
       if (!task) return this.json({}, 404);
       if (!this.canEditCard(au, task)) return this.json({}, 401);
-      return await this.assignmentOperation(task, op);
+      return await this.assignmentOperation(task, (t) => op(t, au));
     });
   }
 
   // Staff decide a member's account-deletion request (approve = GDPR anonymize, reject requires a reason).
   @httpPost("/:id/accountDeletionDecision")
-  public async accountDeletionDecision(@requestParam("id") id: string, req: express.Request<{}, {}, { outcome?: string; reason?: string }>, res: express.Response): Promise<any> {
+  public async accountDeletionDecision(@requestParam("id") id: string, req: express.Request<{}, {}, { outcome?: string; reason?: string }>, res: express.Response): Promise<unknown> {
     return this.actionWrapper(req, res, async (au) => {
       if (!au.checkAccess(Permissions.people.edit)) return this.json({}, 401);
       const task = (await this.repos.task.load(au.churchId, id)) as Task;
@@ -290,7 +329,7 @@ export class TaskController extends DoingBaseController {
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/moveStep")
-  public async moveStep(@requestParam("id") id: string, req: express.Request<{}, {}, { stepId: string }>, res: express.Response): Promise<any> {
+  public async moveStep(@requestParam("id") id: string, req: express.Request<{}, {}, { stepId: string }>, res: express.Response): Promise<unknown> {
     // Manual placement: suppress onEnter routing so the card stays where it was dropped.
     return this.withCard(req, res, id, async (task) => {
       if (!(await this.stepInCardWorkflow(task, req.body.stepId))) return this.json({ message: "Step is not in this card's workflow" }, 400);
@@ -300,43 +339,43 @@ export class TaskController extends DoingBaseController {
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/skip")
-  public async skip(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async skip(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.withCard(req, res, id, (task) => WorkflowHelper.moveRelative(task, 1, this.repos));
   }
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/sendBack")
-  public async sendBack(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
+  public async sendBack(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<unknown> {
     return this.withCard(req, res, id, (task) => WorkflowHelper.moveRelative(task, -1, this.repos));
   }
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/complete")
-  public async complete(@requestParam("id") id: string, req: express.Request<{}, {}, { routeId?: string }>, res: express.Response): Promise<any> {
+  public async complete(@requestParam("id") id: string, req: express.Request<{}, {}, { routeId?: string }>, res: express.Response): Promise<unknown> {
     return this.withCard(req, res, id, (task) => WorkflowHelper.complete(task, this.repos, req.body?.routeId));
   }
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/remove")
-  public async remove(@requestParam("id") id: string, req: express.Request, res: express.Response): Promise<any> {
+  public async remove(@requestParam("id") id: string, req: express.Request, res: express.Response): Promise<unknown> {
     return this.withCard(req, res, id, (task) => WorkflowHelper.remove(task, this.repos));
   }
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/reassign")
-  public async reassign(@requestParam("id") id: string, req: express.Request<{}, {}, { assignedToType?: string; assignedToId?: string; assignedToLabel?: string }>, res: express.Response): Promise<any> {
-    return this.withCard(req, res, id, (task) => WorkflowHelper.reassign(task, { type: req.body.assignedToType, id: req.body.assignedToId, label: req.body.assignedToLabel }, this.repos));
+  public async reassign(@requestParam("id") id: string, req: express.Request<{}, {}, { assignedToType?: string; assignedToId?: string; assignedToLabel?: string }>, res: express.Response): Promise<unknown> {
+    return this.withCard(req, res, id, (task, au) => WorkflowHelper.reassign(task, { type: req.body.assignedToType, id: req.body.assignedToId, label: req.body.assignedToLabel }, this.repos, au.personId));
   }
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/pin")
-  public async pin(@requestParam("id") id: string, req: express.Request<{}, {}, { pinned: boolean }>, res: express.Response): Promise<any> {
+  public async pin(@requestParam("id") id: string, req: express.Request<{}, {}, { pinned: boolean }>, res: express.Response): Promise<unknown> {
     return this.withCard(req, res, id, (task) => WorkflowHelper.setPinned(task, req.body.pinned !== false, this.repos));
   }
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/conversation")
-  public async setConversation(@requestParam("id") id: string, req: express.Request<{}, {}, { conversationId: string }>, res: express.Response): Promise<any> {
+  public async setConversation(@requestParam("id") id: string, req: express.Request<{}, {}, { conversationId: string }>, res: express.Response): Promise<unknown> {
     // First conversation wins so two editors never split a card's notes.
     return this.withCard(req, res, id, async (task) => {
       if (task.conversationId) return task;
@@ -353,8 +392,16 @@ export class TaskController extends DoingBaseController {
 
   // authz-exempt: gated by withCard → canEditCard(au, task) (tasks.edit or assignee)
   @httpPost("/:id/snooze")
-  public async snooze(@requestParam("id") id: string, req: express.Request<{}, {}, { days: number }>, res: express.Response): Promise<any> {
-    return this.withCard(req, res, id, (task) => WorkflowHelper.snooze(task, req.body.days, this.repos));
+  public async snooze(@requestParam("id") id: string, req: express.Request<{}, {}, { days?: number; until?: string }>, res: express.Response): Promise<unknown> {
+    const until = TaskController.snoozeUntil(req.body);
+    return this.withCard(req, res, id, async (task) => (until === null ? this.json({ message: "Invalid snooze date" }, 400) : WorkflowHelper.snooze(task, until, this.repos)));
+  }
+
+  // A picked date wakes the card at that moment; otherwise snooze for a number of days.
+  private static snoozeUntil(body: { days?: number; until?: string }): number | Date | null {
+    if (!body?.until) return Number(body?.days) > 0 ? Number(body.days) : null;
+    const until = new Date(body.until);
+    return isNaN(until.getTime()) || until.getTime() <= Date.now() ? null : until;
   }
 
 }

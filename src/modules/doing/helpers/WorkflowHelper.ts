@@ -2,7 +2,7 @@ import { DateHelper } from "@churchapps/apihelper";
 import { Repos } from "../repositories/index.js";
 import { RepoManager } from "../../../shared/infrastructure/index.js";
 import { NotificationService } from "../../../shared/helpers/NotificationService.js";
-import { Task, Workflow, WorkflowStep, WorkflowStepRoute } from "../models/index.js";
+import { Task, Workflow, WorkflowStep, WorkflowStepAction, WorkflowStepRoute } from "../models/index.js";
 import { ConjunctionHelper } from "./ConjunctionHelper.js";
 import { AssignmentWorkflowHelper } from "./AssignmentWorkflowHelper.js";
 import { WorkflowTemplate } from "./WorkflowTemplates.js";
@@ -21,7 +21,7 @@ export class WorkflowHelper {
 
   private static rejectAssignmentWorkflow(workflow: Workflow) {
     if (workflow?.workflowType !== AssignmentWorkflowHelper.workflowType) return;
-    const err: any = new Error("Issue serving requests from a plan to use this workflow");
+    const err: Error & { status?: number } = new Error("Issue serving requests from a plan to use this workflow");
     err.status = 400;
     throw err;
   }
@@ -253,19 +253,21 @@ export class WorkflowHelper {
     return await this.closeCard(task, repos);
   }
 
-  public static async snooze(task: Task, days: number, repositories?: Repos): Promise<Task> {
+  public static async snooze(task: Task, until: number | Date, repositories?: Repos): Promise<Task> {
     const repos = await this.getRepos(repositories);
-    task.snoozedUntil = DateHelper.addDays(new Date(), Number(days));
+    task.snoozedUntil = until instanceof Date ? until : DateHelper.addDays(new Date(), Number(until));
     return await repos.task.save(task);
   }
 
-  public static async reassign(task: Task, target: AssignTarget, repositories?: Repos): Promise<Task> {
+  public static async reassign(task: Task, target: AssignTarget, repositories?: Repos, actorPersonId?: string): Promise<Task> {
     const repos = await this.getRepos(repositories);
+    if (target.id !== task.assignedToId) StepActionHelper.appendHistory(task, `Reassigned from ${task.assignedToLabel || "unassigned"} to ${target.label || "unassigned"}`);
     task.assignedToType = target.type;
     task.assignedToId = target.id;
     task.assignedToLabel = target.label;
     const saved = await repos.task.save(task);
-    await this.notifyAssignee(saved, `You have been assigned a card: ${saved.title || ""}`);
+    const selfAssigned = target.type === "person" && !!actorPersonId && target.id === actorPersonId;
+    if (!selfAssigned) await this.notifyAssignee(saved, `You have been assigned a card: ${saved.title || ""}`);
     return saved;
   }
 
@@ -305,12 +307,13 @@ export class WorkflowHelper {
           defaultAssignToType: step.defaultAssignToType,
           defaultAssignToId: step.defaultAssignToId,
           defaultAssignToLabel: step.defaultAssignToLabel,
-          expectedResponseDays: step.expectedResponseDays
+          expectedResponseDays: step.expectedResponseDays,
+          instructions: step.instructions
         })) as WorkflowStep;
         if (newStep.id) createdStepIds.push(newStep.id);
         if (step.id && newStep.id) {
           stepMap.set(step.id, newStep.id);
-          const actions = (await repos.workflowStepAction.loadForStep(churchId, step.id)) as any[];
+          const actions = (await repos.workflowStepAction.loadForStep(churchId, step.id)) as WorkflowStepAction[];
           for (const action of actions) {
             await repos.workflowStepAction.save({ churchId, stepId: newStep.id, sort: action.sort, actionType: action.actionType, config: action.config });
           }

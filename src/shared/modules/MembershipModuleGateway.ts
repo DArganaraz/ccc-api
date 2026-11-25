@@ -1,8 +1,9 @@
 import { sql } from "kysely";
 import { RepoManager } from "../infrastructure/RepoManager.js";
-import { KyselyPool } from "../infrastructure/KyselyPool.js";
+import { DynamicDatabase, KyselyPool } from "../infrastructure/KyselyPool.js";
 import { WebhookDispatcher } from "../webhooks/WebhookDispatcher.js";
 import { GdprErasureHelper } from "../../modules/membership/helpers/GdprErasureHelper.js";
+import type { Repos as MembershipRepos } from "../../modules/membership/repositories/index.js";
 
 // Gateway contract; Db impl is swappable for HTTP if ever separate service.
 
@@ -37,7 +38,7 @@ export interface MembershipModuleGateway {
   loadGroup(churchId: string, groupId: string): Promise<{ id: string; name: string; categoryName?: string; discussionsEnabled?: boolean | number; announcementsEnabled?: boolean | number } | null>;
   searchPersonByEmail(churchId: string, email: string): Promise<{ id: string; householdId: string; email: string }[]>;
   loadPerson(churchId: string, personId: string): Promise<{
-    id: string; householdId: string; email: string; firstName?: string; lastName?: string; displayName?: string; mobilePhone?: string; optedOut?: boolean | number;
+    id: string; householdId: string; email: string; firstName?: string; lastName?: string; displayName?: string; mobilePhone?: string; optedOut?: boolean | number; smsOptedOut?: boolean | number; donorNumber?: string;
     membershipStatus?: string; gender?: string; maritalStatus?: string; birthDate?: Date; householdRole?: string;
   } | null>;
   getOrCreateGuestPerson(churchId: string, guestInfo: GuestInfo): Promise<{ personId: string; householdId: string; email: string }>;
@@ -50,6 +51,8 @@ export interface MembershipModuleGateway {
   loadList(churchId: string, listId: string): Promise<{ id: string; name: string } | null>;
   loadListMemberPersonIds(churchId: string, listId: string): Promise<string[]>;
   loadSetting(churchId: string, keyName: string): Promise<string | null>;
+  // Saves a church setting that is not public (public stays NULL).
+  saveSetting(churchId: string, keyName: string, value: string): Promise<void>;
   loadGroupsForCheckin(churchId: string, groupIds: string[]): Promise<CheckinGroup[]>;
   loadActiveGroupIds(churchId: string, ids: string[]): Promise<string[]>;
   loadHouseholdAdults(churchId: string, personIds: string[]): Promise<HouseholdAdult[]>;
@@ -66,11 +69,28 @@ interface CheckinGroup {
   minVolunteers?: number;
 }
 
+interface CheckinGroupRow {
+  id: string;
+  name: string;
+  capacity?: number | null;
+  guestCapacity?: number | null;
+  checkinClosed?: boolean | number;
+  volunteerRatio?: number | null;
+  minVolunteers?: number | null;
+}
+
+interface HouseholdAdultRow {
+  id: string;
+  displayName?: string;
+  mobilePhone?: string;
+  smsOptedOut?: boolean | number;
+}
+
 export interface HouseholdAdult {
   personId: string;
   name: string;
   mobilePhone: string;
-  optedOut: boolean;
+  smsOptedOut: boolean;
 }
 
 class MembershipModuleGatewayDb implements MembershipModuleGateway {
@@ -101,12 +121,13 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
     ["endsWith", (v) => `%${v}`]
   ]);
 
+  // Untyped schema: these queries compare tinyint flags (removed, leader) to 0/1 literals.
   private getDb() {
-    return KyselyPool.getDb("membership") as any;
+    return KyselyPool.getDb<DynamicDatabase>("membership");
   }
 
   private async repos() {
-    return RepoManager.getRepos<any>("membership");
+    return RepoManager.getRepos<MembershipRepos>("membership");
   }
 
   private getDBField(condition: ConditionInput) {
@@ -159,7 +180,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .select("id")
       .where("churchId", "=", condition.churchId)
       .where("removed", "=", 0)
-      .where(sql`${sql.raw(dbField)} ${sql.raw(operator)} ${dbValue}`)
+      .where(sql<boolean>`${sql.raw(dbField)} ${sql.raw(operator)} ${dbValue}`)
       .execute()) as { id: string }[];
 
     return rows.map((r) => r.id);
@@ -173,7 +194,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .where("removed", "=", 0)
       .where("id", "in", personIds)
       .orderBy("lastName").orderBy("firstName")
-      .execute();
+      .execute() as Promise<{ id: string; displayName: string }[]>;
   }
 
   public async loadGroupMembersForPerson(churchId: string, personId: string): Promise<{ groupId: string }[]> {
@@ -231,7 +252,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .where("churchId", "=", churchId)
       .where("removed", "=", 0)
       .where("householdId", "in", householdIds)
-      .execute();
+      .execute() as Promise<{ id: string; householdId: string }[]>;
   }
 
   public async loadChurch(churchId: string) {
@@ -248,7 +269,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .where("timezone", "<>", "")
       .orderBy("id")
       .executeTakeFirst();
-    return row?.timezone || null;
+    return (row?.timezone as string) || null;
   }
 
   public async loadCampusTimeZones(churchId: string) {
@@ -286,8 +307,8 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       ? await this.getDb().selectFrom("people").select(["id", "householdId", "email"])
         .where("churchId", "=", churchId)
         .where("email", "=", email)
-        .where("removed", "=", false as any)
-        .executeTakeFirst()
+        .where("removed", "=", false)
+        .executeTakeFirst() as { id: string; householdId: string; email: string } | undefined
       : null;
     if (existing) return { personId: existing.id, householdId: existing.householdId, email: existing.email };
     const household = await repos.household.save({ churchId, name: guestInfo.lastName });
@@ -299,7 +320,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       householdId: household.id,
       householdRole: "Head",
       membershipStatus: "Guest"
-    } as any);
+    });
     await WebhookDispatcher.emit(churchId, "person.created", person);
     return { personId: person.id, householdId: household.id, email: guestInfo.email };
   }
@@ -307,7 +328,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
   public async addGroupMember(churchId: string, groupId: string, personId: string): Promise<void> {
     const repos = await this.repos();
     const existing = await repos.groupMember.loadForPerson(churchId, personId);
-    if (Array.isArray(existing) && existing.some((m: any) => m.groupId === groupId)) return;
+    if (Array.isArray(existing) && existing.some((m) => m.groupId === groupId)) return;
     await repos.groupMember.save({ churchId, groupId, personId, leader: false });
     await repos.groupMemberHistory.log(churchId, groupId, personId, "joined");
     await WebhookDispatcher.emit(churchId, "group.member.added", { churchId, groupId, personId });
@@ -331,7 +352,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .select(["id", "displayName", "membershipStatus", "gender", "maritalStatus"])
       .where("churchId", "=", churchId)
       .where("removed", "=", 0)
-      .execute();
+      .execute() as Promise<{ id: string; displayName: string; membershipStatus?: string; gender?: string; maritalStatus?: string }[]>;
   }
 
   public async loadList(churchId: string, listId: string) {
@@ -339,7 +360,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .select(["id", "name"])
       .where("churchId", "=", churchId)
       .where("id", "=", listId)
-      .executeTakeFirst();
+      .executeTakeFirst() as { id: string; name: string } | undefined;
     return row ?? null;
   }
 
@@ -361,14 +382,19 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
     return (row?.value as string) ?? null;
   }
 
+  public async saveSetting(churchId: string, keyName: string, value: string): Promise<void> {
+    const repos = await this.repos();
+    await repos.setting.save({ churchId, keyName, value });
+  }
+
   public async loadActiveGroupIds(churchId: string, ids: string[]): Promise<string[]> {
     if (ids.length === 0) return [];
     const rows = (await this.getDb().selectFrom("groups")
       .select(["id"])
       .where("churchId", "=", churchId)
       .where("id", "in", ids)
-      .where("removed", "=", false as any)
-      .execute()) as any[];
+      .where("removed", "=", false)
+      .execute()) as { id: string }[];
     return rows.map((r) => r.id);
   }
 
@@ -378,7 +404,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
       .select(["id", "name", "capacity", "guestCapacity", "checkinClosed", "volunteerRatio", "minVolunteers"])
       .where("churchId", "=", churchId)
       .where("id", "in", groupIds)
-      .execute()) as any[];
+      .execute()) as CheckinGroupRow[];
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -401,17 +427,17 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
     const householdIds = [...new Set(seeds.map((p) => p.householdId).filter((id) => !!id))];
     if (householdIds.length === 0) return [];
     const rows = (await this.getDb().selectFrom("people")
-      .select(["id", "displayName", "mobilePhone", "optedOut"])
+      .select(["id", "displayName", "mobilePhone", "smsOptedOut"])
       .where("churchId", "=", churchId)
       .where("removed", "=", 0)
       .where("householdId", "in", householdIds)
-      .where((eb: any) => eb.or([eb("householdRole", "is", null), eb("householdRole", "!=", "Child")]))
-      .execute()) as any[];
+      .where((eb) => eb.or([eb("householdRole", "is", null), eb("householdRole", "!=", "Child")]))
+      .execute()) as HouseholdAdultRow[];
     return rows.map((r) => ({
       personId: r.id,
       name: r.displayName || "",
       mobilePhone: r.mobilePhone || "",
-      optedOut: r.optedOut === true || r.optedOut === 1
+      smsOptedOut: r.smsOptedOut === true || r.smsOptedOut === 1
     }));
   }
 
@@ -428,7 +454,7 @@ class MembershipModuleGatewayDb implements MembershipModuleGateway {
     const repos = await this.repos();
     const userChurch = await repos.userChurch.loadByPersonId(personId, churchId);
     const userId = userChurch?.userId || null;
-    const person: any = await repos.person.load(churchId, personId);
+    const person = await repos.person.load(churchId, personId);
     await GdprErasureHelper.anonymize(churchId, personId, userId, repos);
     await WebhookDispatcher.emit(churchId, "person.destroyed", { id: personId, churchId, email: person?.email });
   }

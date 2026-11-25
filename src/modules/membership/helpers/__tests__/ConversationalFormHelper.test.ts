@@ -1,4 +1,6 @@
 import { ConversationalFormHelper } from "../ConversationalFormHelper.js";
+import type { Household, Person, Question } from "../../models/index.js";
+import type { Repos } from "../../repositories/index.js";
 
 const q = (id: string, fieldType: string, title: string) => ({ id, fieldType, title });
 const a = (questionId: string, value: string) => ({ questionId, value });
@@ -56,20 +58,50 @@ describe("ConversationalFormHelper.applyTokens", () => {
 
   it("returns falsy templates unchanged", () => {
     expect(ConversationalFormHelper.applyTokens("", { firstName: "X" })).toBe("");
-    expect(ConversationalFormHelper.applyTokens(null as any, {})).toBeNull();
+    expect(ConversationalFormHelper.applyTokens(null as string, {})).toBeNull();
+  });
+});
+
+describe("ConversationalFormHelper.answersTable", () => {
+  it("lists each answered question with readable, escaped values", () => {
+    const questions: Question[] = [
+      q("h1", "Heading", "About you"),
+      q("q1", "Textbox", "Name"),
+      q("q2", "Yes/No", "First visit?"),
+      Object.assign({} as Question, { id: "q3", fieldType: "Multiple Choice", title: "Service", choices: [{ text: "9:00 AM", value: "early" }, { text: "11:00 AM", value: "late" }] }),
+      Object.assign({} as Question, { id: "q4", fieldType: "Checkbox", title: "Interests", choices: [{ text: "Kids", value: "k" }, { text: "Music", value: "m" }] }),
+      q("q5", "Textbox", "Notes")
+    ];
+    const answers = [a("q1", "<b>Sam</b>"), a("q2", "True"), a("q3", "late"), a("q4", "k,m"), a("q5", "  ")];
+    const html = ConversationalFormHelper.answersTable(questions, answers);
+    expect(html).toContain("&lt;b&gt;Sam&lt;/b&gt;");
+    expect(html).toContain(">Yes<");
+    expect(html).toContain(">11:00 AM<");
+    expect(html).toContain(">Kids, Music<");
+    expect(html).not.toContain("About you");
+    expect(html).not.toContain("Notes");
+  });
+
+  it("is empty when nothing was answered", () => {
+    expect(ConversationalFormHelper.answersTable([q("q1", "Textbox", "Name")], [])).toBe("");
+  });
+
+  it("fills {answers} in a template", () => {
+    expect(ConversationalFormHelper.applyTokens("Thanks!{answers}", { answers: "<table></table>" })).toBe("Thanks!<table></table>");
+    expect(ConversationalFormHelper.applyTokens("Your {answers}", {})).toBe("Your ");
   });
 });
 
 describe("ConversationalFormHelper.findOrCreatePerson", () => {
-  const makeRepos = (searchResult: any[]) => {
+  const makeRepos = (searchResult: { id: string; email: string }[]) => {
     const person = {
-      save: jest.fn(async (p: any) => ({ ...p, id: "newPid" })),
+      save: jest.fn(async (p: Person) => ({ ...p, id: "newPid" })),
       load: jest.fn(async (_c: string, id: string) => ({ id, email: "created@x.com" })),
       searchEmail: jest.fn(async () => searchResult),
-      convertToModel: jest.fn((_c: string, row: any) => row)
+      convertToModel: jest.fn((_c: string, row: Person) => row)
     };
-    const household = { save: jest.fn(async (h: any) => Object.assign(h, { id: "hh1" })) };
-    return { person, household } as any;
+    const household = { save: jest.fn(async (h: Household) => Object.assign(h, { id: "hh1" })) };
+    return Object.assign({} as Repos, { person, household });
   };
 
   it("returns null without an email", async () => {

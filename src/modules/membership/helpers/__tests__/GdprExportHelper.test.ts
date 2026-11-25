@@ -24,7 +24,8 @@ const contentGateway = {
   loadRegistrationsByPerson: jest.fn(async () => [{ id: "r1" }]),
   loadRegistrationMembersByPerson: jest.fn(async () => [{ id: "rm1" }]),
   loadEventRsvpsByPerson: jest.fn(async () => [{ id: "rsvp1" }]),
-  loadEventBookingsByPerson: jest.fn(async () => [{ id: "bk1" }])
+  loadEventBookingsByPerson: jest.fn(async () => [{ id: "bk1" }]),
+  loadPersonDocuments: jest.fn(async () => ({ files: [{ id: "pf1", fileName: "baptism.pdf" }], links: [{ id: "pl1", text: "Certificate" }] }))
 };
 
 jest.mock("../../../../shared/modules/index.js", () => ({
@@ -38,16 +39,16 @@ jest.mock("../../../../shared/modules/index.js", () => ({
 import { GdprExportHelper } from "../GdprExportHelper.js";
 
 const buildRepos = () => ({
-  person: { load: jest.fn(async () => ({ id: "p1", householdId: "h1" })) },
-  household: { load: jest.fn(async () => ({ id: "h1", name: "Smith" })) },
-  groupMember: { loadForPerson: jest.fn(async () => [{ id: "gm1" }]) },
-  groupJoinRequest: { loadForPerson: jest.fn(async () => [{ id: "gjr1" }]) },
-  visibilityPreference: { loadForPerson: jest.fn(async () => [{ id: "vp1" }]) },
-  personFieldValue: { loadForPerson: jest.fn(async () => [{ id: "pfv1", value: "Blue" }]) },
-  memberPermission: { loadFormsByPerson: jest.fn(async () => [{ id: "mp1" }]) },
-  formSubmission: { loadForContent: jest.fn(async () => [{ id: "fs1" }]) },
-  answer: { loadForFormSubmission: jest.fn(async () => [{ id: "ans1", value: "Yes" }]) }
-}) as any;
+  person: { load: jest.fn().mockResolvedValue(({ id: "p1", householdId: "h1" })) },
+  household: { load: jest.fn().mockResolvedValue(({ id: "h1", name: "Smith" })) },
+  groupMember: { loadForPerson: jest.fn().mockResolvedValue([{ id: "gm1" }]) },
+  groupJoinRequest: { loadForPerson: jest.fn().mockResolvedValue([{ id: "gjr1" }]) },
+  visibilityPreference: { loadForPerson: jest.fn().mockResolvedValue([{ id: "vp1" }]) },
+  personFieldValue: { loadForPerson: jest.fn().mockResolvedValue([{ id: "pfv1", value: "Blue" }]) },
+  memberPermission: { loadFormsByPerson: jest.fn().mockResolvedValue([{ id: "mp1" }]) },
+  formSubmission: { loadForContent: jest.fn().mockResolvedValue([{ id: "fs1" }]) },
+  answer: { loadForFormSubmission: jest.fn().mockResolvedValue([{ id: "ans1", value: "Yes" }]) }
+});
 
 describe("GdprExportHelper.exportPersonData", () => {
   beforeEach(() => jest.clearAllMocks());
@@ -70,6 +71,8 @@ describe("GdprExportHelper.exportPersonData", () => {
     expect(result.registrationMembers).toEqual([{ id: "rm1" }]);
     expect(result.eventRsvps).toEqual([{ id: "rsvp1" }]);
     expect(result.eventBookings).toEqual([{ id: "bk1" }]);
+    expect(contentGateway.loadPersonDocuments).toHaveBeenCalledWith("c1", "p1");
+    expect(result.documents).toEqual({ files: [{ id: "pf1", fileName: "baptism.pdf" }], links: [{ id: "pl1", text: "Certificate" }] });
   });
 
   it("nests form submission answers under each submission", async () => {
@@ -85,7 +88,7 @@ describe("GdprExportHelper.exportPersonData", () => {
 
     expect(messagingGateway.loadPersonNotes).toHaveBeenCalledWith("c1", "p1", ["person"]);
     expect(result.confidentialNotesIncluded).toBe(false);
-    expect(result.notes.map((n: any) => n.contentType)).toEqual(["person"]);
+    expect(result.notes.map((n) => n.contentType)).toEqual(["person"]);
   });
 
   it("includes confidential notes when the caller has the permission", async () => {
@@ -93,12 +96,12 @@ describe("GdprExportHelper.exportPersonData", () => {
 
     expect(messagingGateway.loadPersonNotes).toHaveBeenCalledWith("c1", "p1", ["person", "personConfidential"]);
     expect(result.confidentialNotesIncluded).toBe(true);
-    expect(result.notes.map((n: any) => n.contentType)).toEqual(["person", "personConfidential"]);
+    expect(result.notes.map((n) => n.contentType)).toEqual(["person", "personConfidential"]);
   });
 
   it("skips the household lookup when the person has none", async () => {
     const repos = buildRepos();
-    repos.person.load = jest.fn(async () => ({ id: "p1" }));
+    repos.person.load.mockResolvedValue({ id: "p1" });
     const result = await GdprExportHelper.exportPersonData("c1", "p1", repos);
 
     expect(repos.household.load).not.toHaveBeenCalled();

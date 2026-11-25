@@ -3,36 +3,43 @@ import { MergeFieldHelper } from "../../modules/messaging/helpers/MergeFieldHelp
 import { PreferenceGateHelper } from "../../modules/messaging/helpers/PreferenceGateHelper.js";
 import { NotificationHelper } from "../../modules/messaging/helpers/NotificationHelper.js";
 import { ChurchEmailLimiter } from "../helpers/ChurchEmailLimiter.js";
+import type { LoadedTextingConfig } from "../../modules/messaging/helpers/TextingConfigHelper.js";
+import type { Repos as MessagingRepos } from "../../modules/messaging/repositories/index.js";
+import type { MessagingDatabase } from "../../modules/messaging/db/DatabaseTypes.js";
+import type { Connection, Conversation, DeliveryLog, Device, Message, Notification, NotificationPreference, PrivateMessage } from "../../modules/messaging/models/index.js";
+
+export type PersonNote = Conversation & { messages: Message[] };
 
 interface EmailRecipient {
   firstName?: string;
   lastName?: string;
   displayName?: string;
   email: string;
+  donorNumber?: string;
 }
 
 // Gateway: the only seam through which other modules read/write messaging data.
 export interface MessagingModuleGateway {
-  loadDevicesByPerson(churchId: string, personId: string): Promise<any[]>;
-  loadDevicesByApp(churchId: string, appName: string): Promise<any[]>;
+  loadDevicesByPerson(churchId: string, personId: string): Promise<Device[]>;
+  loadDevicesByApp(churchId: string, appName: string): Promise<Device[]>;
   // Raw row including the device secret; callers must never return it to clients.
-  loadDeviceByDeviceId(deviceId: string): Promise<any | null>;
+  loadDeviceByDeviceId(deviceId: string): Promise<Device | null>;
   saveDeviceStatus(churchId: string, id: string, status: unknown): Promise<void>;
-  loadNotificationsByPerson(churchId: string, personId: string): Promise<any[]>;
-  loadNotificationPreferencesByPerson(churchId: string, personId: string): Promise<any[]>;
-  loadPrivateMessagesByPerson(churchId: string, personId: string): Promise<any[]>;
-  loadConnectionsByPerson(churchId: string, personId: string): Promise<any[]>;
-  loadDeliveryLogsByPerson(churchId: string, personId: string): Promise<any[]>;
+  loadNotificationsByPerson(churchId: string, personId: string): Promise<Notification[]>;
+  loadNotificationPreferencesByPerson(churchId: string, personId: string): Promise<NotificationPreference | undefined>;
+  loadPrivateMessagesByPerson(churchId: string, personId: string): Promise<PrivateMessage[]>;
+  loadConnectionsByPerson(churchId: string, personId: string): Promise<Connection[]>;
+  loadDeliveryLogsByPerson(churchId: string, personId: string): Promise<DeliveryLog[]>;
   // Person notes are conversations; the caller passes the contentTypes it is allowed to read.
-  loadPersonNotes(churchId: string, personId: string, contentTypes: string[]): Promise<any[]>;
-  loadConversation(churchId: string, id: string): Promise<any | null>;
+  loadPersonNotes(churchId: string, personId: string, contentTypes: string[]): Promise<PersonNote[]>;
+  loadConversation(churchId: string, id: string): Promise<Conversation | null>;
   // Starts a person's hidden Notes conversation with one message; returns the conversation id.
   createPersonNote(churchId: string, personId: string, title: string, text: string): Promise<string>;
-  createNotifications(notifications: any[]): Promise<any[]>;
+  createNotifications(notifications: Notification[]): Promise<Notification[]>;
   // Render a saved EmailTemplate and send through notification funnel; returns false if template missing or no email.
   // extras fills the gift merge fields ({{amount}}, {{giftDate}}, {{fund}}, {{receipt}}) for donation-started workflows.
   sendTemplatedEmail(churchId: string, personId: string, templateId: string, recipient: EmailRecipient, churchName: string, subjectOverride?: string, extras?: Record<string, string>): Promise<boolean>;
-  sendServingWorkflowMessage(churchId: string, personId: string, taskId: string, channel: "email" | "sms", person: { email?: string; mobilePhone?: string; optedOut?: boolean | number; firstName?: string; lastName?: string; displayName?: string }, message: { subject: string; html: string; text: string }, churchName: string): Promise<string>;
+  sendServingWorkflowMessage(churchId: string, personId: string, taskId: string, channel: "email" | "sms", person: { email?: string; mobilePhone?: string; smsOptedOut?: boolean | number; firstName?: string; lastName?: string; displayName?: string }, message: { subject: string; html: string; text: string }, churchName: string): Promise<string>;
   // Ad-hoc bulk SMS (pre-filtered recipients, capped at 500); returns { ok: false, reason: "no_provider" } if no provider.
   sendBulkText(churchId: string, recipients: BulkTextRecipient[], message: string, context?: string): Promise<BulkTextResult>;
   // Automated SMS to one person with merge fields resolved (caller checks opt-out); returns { ok: false, reason } on no_provider, insufficient_credits or provider error.
@@ -44,6 +51,7 @@ interface TextRecipient {
   firstName?: string;
   lastName?: string;
   displayName?: string;
+  donorNumber?: string;
 }
 
 interface BulkTextRecipient {
@@ -60,7 +68,7 @@ interface BulkTextResult {
 
 class MessagingModuleGatewayDb implements MessagingModuleGateway {
   private async repos() {
-    return RepoManager.getRepos<any>("messaging");
+    return RepoManager.getRepos<MessagingRepos>("messaging");
   }
 
   public async loadDevicesByPerson(churchId: string, personId: string) {
@@ -95,7 +103,7 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
   public async loadConnectionsByPerson(churchId: string, personId: string) {
     // Lazy-load so importers of this gateway don't transitively pull Environment at module scope.
     const { KyselyPool } = await import("../infrastructure/KyselyPool.js");
-    return KyselyPool.getDb<any>("messaging").selectFrom("connections").selectAll()
+    return KyselyPool.getDb<MessagingDatabase>("messaging").selectFrom("connections").selectAll()
       .where("churchId", "=", churchId)
       .where("personId", "=", personId)
       .execute();
@@ -109,7 +117,7 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
     if (contentTypes.length === 0) return [];
     const repos = await this.repos();
     const conversations = (await Promise.all(contentTypes.map((ct) => repos.conversation.loadForContent(churchId, ct, personId)))).flat();
-    return Promise.all(conversations.map(async (c: any) => ({ ...c, messages: await repos.message.loadForConversation(churchId, c.id) })));
+    return Promise.all(conversations.map(async (c) => ({ ...c, messages: await repos.message.loadForConversation(churchId, c.id) })));
   }
 
   public async loadConversation(churchId: string, id: string) {
@@ -124,7 +132,7 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
     return conversation.id as string;
   }
 
-  public async createNotifications(notifications: any[]) {
+  public async createNotifications(notifications: Notification[]) {
     const repos = await this.repos();
     return Promise.all(notifications.map((n) => repos.notification.save(n)));
   }
@@ -152,14 +160,14 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
 
   // Direct workflow attempt: never queues an unread-email escalation which could
   // outlive the request. The card records blocked/skipped/uncertain outcomes.
-  public async sendServingWorkflowMessage(churchId: string, personId: string, taskId: string, channel: "email" | "sms", person: { email?: string; mobilePhone?: string; optedOut?: boolean | number; firstName?: string; lastName?: string; displayName?: string }, message: { subject: string; html: string; text: string }, churchName: string): Promise<string> {
+  public async sendServingWorkflowMessage(churchId: string, personId: string, taskId: string, channel: "email" | "sms", person: { email?: string; mobilePhone?: string; smsOptedOut?: boolean | number; firstName?: string; lastName?: string; displayName?: string }, message: { subject: string; html: string; text: string }, churchName: string): Promise<string> {
     const repos = await this.repos();
     const pref = await repos.notificationPreference.loadByPersonId(churchId, personId);
     const overrides = await repos.notificationPreferenceOverride.loadForPerson(churchId, personId);
     const gate = PreferenceGateHelper.evaluate(churchId, personId, "serving_schedule", channel, { pref, overrides });
     if (!gate.allow) return `skipped (${gate.reason || gate.decision})`;
     if (channel === "sms") {
-      if (person.optedOut || !person.mobilePhone?.trim()) return "skipped (opted out or no mobile phone)";
+      if (person.smsOptedOut || !person.mobilePhone?.trim()) return "skipped (opted out or no mobile phone)";
       const result = await this.sendPersonText(churchId, personId, { ...person, phoneNumber: person.mobilePhone.trim() }, message.text, churchName);
       return result.ok ? "sent" : `blocked (${result.reason || "provider failure"})`;
     }
@@ -181,7 +189,7 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
 
     const phones = capped.map((r) => r.phoneNumber);
     const results = await provider.sendBulk(config, phones, message);
-    const successCount = results.filter((r: any) => r.success).length;
+    const successCount = results.filter((r) => r.success).length;
     const failCount = results.length - successCount;
 
     const savedSentText = await repos.sentText.save({
@@ -193,7 +201,7 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
       failCount
     });
 
-    const logPromises: Promise<any>[] = [];
+    const logPromises: Promise<unknown>[] = [];
     capped.forEach((r, i) => {
       logPromises.push(repos.deliveryLog.save({
         churchId,
@@ -247,7 +255,7 @@ class MessagingModuleGatewayDb implements MessagingModuleGateway {
     return result.success ? { ok: true } : { ok: false, reason: result.error || "send_failed" };
   }
 
-  private async getTextingConfig(repos: any, churchId: string): Promise<any | null> {
+  private async getTextingConfig(repos: MessagingRepos, churchId: string): Promise<LoadedTextingConfig | null> {
     const { TextingConfigHelper } = await import("../../modules/messaging/helpers/TextingConfigHelper.js");
     return TextingConfigHelper.load(repos.textingProvider, churchId);
   }

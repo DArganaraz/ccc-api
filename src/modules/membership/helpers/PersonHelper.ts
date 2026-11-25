@@ -3,11 +3,15 @@ import { RepoManager } from "../../../shared/infrastructure/index.js";
 import { Household, Person, UserChurch } from "../models/index.js";
 import { AuthenticatedUser } from "../auth/index.js";
 import { Permissions } from "../../../shared/helpers/index.js";
-import { PersonHelper as BasePersonHelper } from "@churchapps/apihelper";
+import { FileStorageHelper, PersonHelper as BasePersonHelper } from "@churchapps/apihelper";
 import { SsoHelper } from "./SsoHelper.js";
 import type { GuestMember, GuestRegistration } from "./GuestRegistrationHelper.js";
 import { WebhookDispatcher } from "../../../shared/webhooks/WebhookDispatcher.js";
 import { getAttendanceModuleGateway, getMessagingModuleGateway } from "../../../shared/modules/index.js";
+import type { Selectable } from "kysely";
+import type { MembershipDatabase } from "../db/DatabaseTypes.js";
+
+type PeopleRow = Selectable<MembershipDatabase["people"]>;
 
 export class PersonHelper extends BasePersonHelper {
   private static async repos(): Promise<Repos> {
@@ -18,9 +22,9 @@ export class PersonHelper extends BasePersonHelper {
     // searchEmail hides removed people, so a caller without allowRestore never even loads a deleted
     // person - it creates a fresh one instead. Only the restoring path looks at removed rows.
     const normalized = (email || "").trim().toLowerCase();
-    const data: Person[] = ((allowRestore
+    const data: PeopleRow[] = (allowRestore
       ? await repos.person.searchEmailIncludingRemoved(churchId, email)
-      : await repos.person.searchEmail(churchId, email)) as any[]).filter((p) => normalized && (p.email || "").trim().toLowerCase() === normalized);
+      : await repos.person.searchEmail(churchId, email)).filter((p) => normalized && (p.email || "").trim().toLowerCase() === normalized);
     if (data.length === 0) {
       const household: Household = { churchId, name: lastName };
       await repos.household.save(household);
@@ -43,6 +47,32 @@ export class PersonHelper extends BasePersonHelper {
       await repos.person.restore(person.churchId, person.id);
     }
     return person;
+  }
+
+  // Stores a PNG data URL as the person's profile photo and records when it changed.
+  public static async savePhoto(churchId: string, person: Person, dataUrl: string) {
+    const key = "/" + churchId + "/membership/people/" + person.id + ".png";
+    await FileStorageHelper.store(key, "image/png", Buffer.from(dataUrl.split(",")[1] || "", "base64"));
+    person.photoUpdated = new Date();
+    person.photo = key + "?dt=" + person.photoUpdated.getTime().toString();
+    await (await this.repos()).person.save(person);
+  }
+
+  // An approved directory update hands back the pending file's URL; move that file onto the person.
+  // Only this church's pending folder is honoured, so a request cannot point at someone else's image.
+  public static async applyPendingPhoto(churchId: string, person: Person): Promise<boolean> {
+    const photo = person?.photo;
+    if (typeof photo !== "string" || !person.id) return false;
+    const prefix = "/" + churchId + "/membership/people/pending/";
+    const start = photo.indexOf(prefix);
+    if (start === -1) return false;
+    const name = photo.slice(start + prefix.length).split("?")[0];
+    if (!/^[A-Za-z0-9_-]+\.png$/.test(name)) return false;
+    await FileStorageHelper.move(prefix + name, "/" + churchId + "/membership/people/" + person.id + ".png");
+    person.photoUpdated = new Date();
+    person.photo = undefined;
+    await (await this.repos()).person.save(person);
+    return true;
   }
 
   public static async registerGuestHousehold(churchId: string, registration: GuestRegistration, groupId?: string, recordAttendance?: boolean) {
@@ -97,11 +127,13 @@ export class PersonHelper extends BasePersonHelper {
       if (m.email) person.contactInfo.email = m.email;
       if (m.phone) person.contactInfo.mobilePhone = m.phone;
       // birthDate is a validated YYYY-MM-DD string; PersonRepo stores it as a date-only value.
-      if (m.birthDate) person.birthDate = m.birthDate as any;
+      // Person.birthDate is typed Date, so the string is assigned without converting it.
+      if (m.birthDate) Object.assign(person, { birthDate: m.birthDate });
       if (m.gender) person.gender = m.gender;
       if (m.grade) person.grade = m.grade;
       if (i === 0 && registration.maritalStatus) person.maritalStatus = registration.maritalStatus;
       const saved = await repos.person.save(person);
+      if (m.photo) await this.savePhoto(churchId, saved, m.photo);
       await WebhookDispatcher.emit(churchId, "person.created", saved);
       people.push(saved);
       submitted.push(m);
@@ -112,7 +144,7 @@ export class PersonHelper extends BasePersonHelper {
       try {
         const group = await repos.group.load(churchId, groupId);
         if (group) {
-          const memberIds = new Set((await repos.groupMember.loadForGroup(churchId, groupId)).map((gm: any) => gm.personId));
+          const memberIds = new Set((await repos.groupMember.loadForGroup(churchId, groupId)).map((gm) => gm.personId));
           for (const p of people) {
             if (memberIds.has(p.id)) continue;
             const gm = await repos.groupMember.save({ churchId, groupId, personId: p.id, joinDate: new Date() });

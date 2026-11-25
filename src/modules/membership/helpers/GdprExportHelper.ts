@@ -1,4 +1,4 @@
-import type { Repos as MembershipRepos } from "../repositories/index.js";
+import type { Repos } from "../repositories/index.js";
 import {
   getGivingModuleGateway,
   getAttendanceModuleGateway,
@@ -9,6 +9,19 @@ import {
 
 export interface GdprExportOptions {
   includeConfidentialNotes?: boolean;
+}
+
+// The membership repo methods the export reads; the full Repos satisfies it.
+interface MembershipRepos {
+  person: Pick<Repos["person"], "load">;
+  household: Pick<Repos["household"], "load">;
+  groupMember: Pick<Repos["groupMember"], "loadForPerson">;
+  groupJoinRequest: Pick<Repos["groupJoinRequest"], "loadForPerson">;
+  visibilityPreference: Pick<Repos["visibilityPreference"], "loadForPerson">;
+  personFieldValue: Pick<Repos["personFieldValue"], "loadForPerson">;
+  memberPermission: Pick<Repos["memberPermission"], "loadFormsByPerson">;
+  formSubmission: Pick<Repos["formSubmission"], "loadForContent">;
+  answer: Pick<Repos["answer"], "loadForFormSubmission">;
 }
 
 export class GdprExportHelper {
@@ -48,7 +61,8 @@ export class GdprExportHelper {
       registrations,
       registrationMembers,
       eventRsvps,
-      eventBookings
+      eventBookings,
+      documents
     ] = await Promise.all([
       membershipRepos.person.load(churchId, personId),
       membershipRepos.groupMember.loadForPerson(churchId, personId),
@@ -75,7 +89,8 @@ export class GdprExportHelper {
       content.loadRegistrationsByPerson(churchId, personId),
       content.loadRegistrationMembersByPerson(churchId, personId),
       content.loadEventRsvpsByPerson(churchId, personId),
-      content.loadEventBookingsByPerson(churchId, personId)
+      content.loadEventBookingsByPerson(churchId, personId),
+      content.loadPersonDocuments(churchId, personId)
     ]);
 
     // Load household if person has one
@@ -113,13 +128,14 @@ export class GdprExportHelper {
       registrations,
       registrationMembers,
       eventRsvps,
-      eventBookings
+      eventBookings,
+      documents
     };
   }
 
   private static async loadFormSubmissions(churchId: string, personId: string, membershipRepos: MembershipRepos) {
     const submissions = await membershipRepos.formSubmission.loadForContent(churchId, "person", personId);
-    return Promise.all((submissions || []).map(async (submission: any) => ({
+    return Promise.all((submissions || []).map(async (submission) => ({
       ...submission,
       answers: await membershipRepos.answer.loadForFormSubmission(churchId, submission.id)
     })));

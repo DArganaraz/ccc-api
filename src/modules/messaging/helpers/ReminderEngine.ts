@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { Repos } from "../repositories/index.js";
 import { ReminderDefinition, ReminderOccurrence } from "../models/index.js";
-import { ReminderAdapterRegistry } from "./ReminderAdapter.js";
+import { ReminderAdapter, ReminderAdapterRegistry, ReminderEntity } from "./ReminderAdapter.js";
 import { TimezoneHelper } from "./TimezoneHelper.js";
 import { NotificationHelper, CreateNotificationOptions } from "./NotificationHelper.js";
 import { PreferenceGateHelper } from "./PreferenceGateHelper.js";
@@ -14,6 +14,8 @@ const DEFAULT_TZ = "America/New_York";
 const MAX_SCAN_ATTEMPTS = 3;
 const SMS_MAX = 160;
 const SMS_OPT_OUT = " Reply STOP to opt out.";
+
+export interface DispatchResult { recipients: number; textsSent: number; textsSkipped: number }
 
 // Reminder engine (architecture §5): expander materializes per-occurrence fire rows; dispatcher claims due rows and produces Notifications. Both ride existing timers — no new infra. Preference gate inside NotificationHelper is the single send-time chokepoint.
 export class ReminderEngine {
@@ -74,7 +76,7 @@ export class ReminderEngine {
   }
 
   // Entity-level keys stay stable (`${defId}:${occISO}:${offset}`); scope rows namespace by entity id so occurrences never collide.
-  private static async materialize(def: ReminderDefinition, adapter: any, entity: any, entityId: string, now: Date, horizon: Date, tz: string, scoped: boolean): Promise<number> {
+  private static async materialize(def: ReminderDefinition, adapter: ReminderAdapter, entity: ReminderEntity, entityId: string, now: Date, horizon: Date, tz: string, scoped: boolean): Promise<number> {
     const occurrences = await adapter.getOccurrences(entity, now, horizon);
     const offsets = this.parseOffsets(def.offsets);
     const sendLocalTime = def.sendLocalTime || "09:00:00";
@@ -124,62 +126,111 @@ export class ReminderEngine {
     for (const occ of due) {
       if (!(await this.repos.reminderOccurrence.claim(occ.id!))) continue; // another worker won it
       processed++;
-      try {
-        const def = await this.repos.reminderDefinition.load(occ.churchId!, occ.definitionId!);
-        if (!def || !(def as any).enabled) { await this.repos.reminderOccurrence.markCancelled(occ.id!); continue; }
-        const adapter = ReminderAdapterRegistry.get(occ.entityType || "");
-        if (!adapter) { await this.repos.reminderOccurrence.markCancelled(occ.id!); continue; }
-        const entity = await adapter.loadEntity(occ.churchId!, occ.entityId!);
-        if (!entity) { await this.repos.reminderOccurrence.markCancelled(occ.id!); continue; }
-
-        const recipients = await adapter.loadRecipients(occ.churchId!, entity, occ.occLocalISO!, (def as any).recipientMode || "auto");
-        const alreadySent = new Set(await this.repos.reminderSentLog.loadPersonIdsForOccurrence(occ.id!));
-        const fresh = recipients.filter((r) => r.personId && !alreadySent.has(r.personId));
-
-        if (fresh.length > 0) {
-          const message = adapter.renderMessage ? adapter.renderMessage(entity, occ.occLocalISO!, occ.message || undefined) : (occ.message || "You have a reminder");
-          const link = adapter.link(entity, occ.occLocalISO!) || undefined;
-          const options: CreateNotificationOptions = { category: occ.category, deliveryStartLevel: 1 };
-          const channels: string[] = ((def as any).channels || "").split(",").map((c: string) => c.trim());
-          if (channels.includes("email")) {
-            options.emailImmediate = true;
-            const emailByPerson = adapter.buildEmails ? await adapter.buildEmails(entity, occ.occLocalISO!, fresh, occ.message || undefined) : null;
-            if (emailByPerson) options.emailByPerson = emailByPerson;
-          }
-          await NotificationHelper.createNotifications(
-            fresh.map((r) => r.personId),
-            occ.churchId!,
-            adapter.contentType,
-            occ.entityId!,
-            message,
-            link,
-            undefined,
-            options
-          );
-          await Promise.all(fresh.map((r) => this.repos.reminderSentLog.insertIgnore({
-            churchId: occ.churchId,
-            occurrenceId: occ.id,
-            entityType: occ.entityType,
-            entityId: occ.entityId,
-            personId: r.personId,
-            channel: "all",
-            category: occ.category,
-            status: "sent",
-            // Key is source-namespaced by entityType (matches the serving writer's "plan:..." keys)
-            // so the shared ledger's dedup fence can't collide across sources.
-            idempotencyKey: crypto.createHash("sha256").update(`${occ.entityType}:${occ.id}:${r.personId}`).digest("hex")
-          })));
-          sent += fresh.length;
-          if (channels.includes("sms")) await this.sendSms(occ, fresh.map((r) => r.personId), message);
-        }
-        await this.repos.reminderOccurrence.markSent(occ.id!, recipients.length);
-      } catch (e) {
-        const error = String((e as Error)?.message || e);
-        if ((Number(occ.attemptCount) || 0) + 1 < MAX_SCAN_ATTEMPTS) await this.repos.reminderOccurrence.markRetry(occ.id!, error);
-        else await this.repos.reminderOccurrence.markFailed(occ.id!, error);
-      }
+      sent += (await this.dispatch(occ)).recipients;
     }
     return { processed, sent };
+  }
+
+  // Sends one claimed occurrence row; returns the fresh recipients and text outcomes (zeros when cancelled or failed).
+  private static async dispatch(occ: ReminderOccurrence): Promise<DispatchResult> {
+    const none: DispatchResult = { recipients: 0, textsSent: 0, textsSkipped: 0 };
+    try {
+      const def = await this.repos.reminderDefinition.load(occ.churchId!, occ.definitionId!);
+      if (!def || !def.enabled) { await this.repos.reminderOccurrence.markCancelled(occ.id!); return none; }
+      const adapter = ReminderAdapterRegistry.get(occ.entityType || "");
+      if (!adapter) { await this.repos.reminderOccurrence.markCancelled(occ.id!); return none; }
+      const entity = await adapter.loadEntity(occ.churchId!, occ.entityId!);
+      if (!entity) { await this.repos.reminderOccurrence.markCancelled(occ.id!); return none; }
+
+      const recipientMode = def.recipientMode || "auto";
+      const recipients = await adapter.loadRecipients(occ.churchId!, entity, occ.occLocalISO!, recipientMode);
+      const alreadySent = new Set(await this.repos.reminderSentLog.loadPersonIdsForOccurrence(occ.id!));
+      const fresh = recipients.filter((r) => r.personId && !alreadySent.has(r.personId));
+      let texts = { textsSent: 0, textsSkipped: 0 };
+
+      if (fresh.length > 0) {
+        const message = adapter.renderMessage ? await adapter.renderMessage(entity, occ.occLocalISO!, occ.message || undefined, recipientMode) : (occ.message || "You have a reminder");
+        const link = adapter.link(entity, occ.occLocalISO!) || undefined;
+        const options: CreateNotificationOptions = { category: occ.category, deliveryStartLevel: 1 };
+        const channels: string[] = (def.channels || "").split(",").map((c: string) => c.trim());
+        if (channels.includes("email")) {
+          options.emailImmediate = true;
+          // Send now rows can be made at will, so their emails draw on ChurchEmailLimiter like workflow email (also on a timer retry).
+          if (this.isSendNowKey(occ.occurrenceKey)) options.churchAuthored = true;
+          const emailByPerson = adapter.buildEmails ? await adapter.buildEmails(entity, occ.occLocalISO!, fresh, occ.message || undefined, recipientMode) : null;
+          if (emailByPerson) options.emailByPerson = emailByPerson;
+        }
+        await NotificationHelper.createNotifications(
+          fresh.map((r) => r.personId),
+          occ.churchId!,
+          adapter.contentType,
+          occ.entityId!,
+          message,
+          link,
+          undefined,
+          options
+        );
+        await Promise.all(fresh.map((r) => this.repos.reminderSentLog.insertIgnore({
+          churchId: occ.churchId,
+          occurrenceId: occ.id,
+          entityType: occ.entityType,
+          entityId: occ.entityId,
+          personId: r.personId,
+          channel: "all",
+          category: occ.category,
+          status: "sent",
+          // Key is source-namespaced by entityType (matches the serving writer's "plan:..." keys)
+          // so the shared ledger's dedup fence can't collide across sources.
+          idempotencyKey: crypto.createHash("sha256").update(`${occ.entityType}:${occ.id}:${r.personId}`).digest("hex")
+        })));
+        if (channels.includes("sms")) texts = await this.sendSms(occ, fresh.map((r) => r.personId), message);
+      }
+      await this.repos.reminderOccurrence.markSent(occ.id!, recipients.length);
+      return { recipients: fresh.length, ...texts };
+    } catch (e) {
+      const error = String((e as Error)?.message || e);
+      if ((Number(occ.attemptCount) || 0) + 1 < MAX_SCAN_ATTEMPTS) await this.repos.reminderOccurrence.markRetry(occ.id!, error);
+      else await this.repos.reminderOccurrence.markFailed(occ.id!, error);
+      return none;
+    }
+  }
+
+  // Send now (issue #1584): one due-now row for the entity's next occurrence, dispatched synchronously. Scheduled rows are untouched and still send.
+  static async sendNow(def: ReminderDefinition, now: Date = new Date()): Promise<DispatchResult> {
+    this.ensureInit();
+    if (!def.id || !def.entityId || !def.enabled) throw new Error("Send now needs a saved, enabled reminder on one task or event");
+    const adapter = ReminderAdapterRegistry.get(def.entityType || "");
+    if (!adapter) throw new Error(`No reminder adapter for ${def.entityType}`);
+    const entity = await adapter.loadEntity(def.churchId!, def.entityId);
+    if (!entity) throw new Error("Reminder target not found");
+
+    const horizon = new Date(now.getTime() + HORIZON_DAYS * 24 * 60 * 60000);
+    const next = (await adapter.getOccurrences(entity, now, horizon))[0];
+    let occLocalISO = next?.startLocalISO;
+    if (!occLocalISO) {
+      const tz = def.timeZone || (await this.churchTimeZone(def.churchId!));
+      occLocalISO = `${TimezoneHelper.localDate(now, tz)}T${def.sendLocalTime || "09:00:00"}`;
+    }
+
+    const occurrenceKey = `${def.id}:now:${now.getTime()}`;
+    await this.repos.reminderOccurrence.upsert({
+      churchId: def.churchId,
+      definitionId: def.id,
+      entityType: def.entityType,
+      entityId: def.entityId,
+      category: def.category,
+      message: def.message,
+      occurrenceKey,
+      occLocalISO,
+      fireAt: now
+    });
+    const occ = (await this.repos.reminderOccurrence.loadByKey(occurrenceKey)) as ReminderOccurrence | undefined;
+    if (!occ || !(await this.repos.reminderOccurrence.claim(occ.id!))) return { recipients: 0, textsSent: 0, textsSkipped: 0 }; // the 30-minute timer won the row and is sending it
+    return this.dispatch(occ);
+  }
+
+  private static isSendNowKey(occurrenceKey?: string): boolean {
+    return (occurrenceKey || "").includes(":now:");
   }
 
   // "Church: message Reply STOP to opt out." trimmed to one 160-char segment.
@@ -192,14 +243,15 @@ export class ReminderEngine {
   }
 
   // Opt-in texts through the church's own provider: allowSms + category gate, then skip opted-out people and missing numbers. Each recipient gets its own ledger row so a text failure never re-sends the push/email.
-  private static async sendSms(occ: ReminderOccurrence, personIds: string[], message: string): Promise<void> {
+  private static async sendSms(occ: ReminderOccurrence, personIds: string[], message: string): Promise<{ textsSent: number; textsSkipped: number }> {
     const churchId = occ.churchId!;
     const membership = getMembershipModuleGateway();
     const church = await membership.loadChurch(churchId);
-    const prefs = ((await this.repos.notificationPreference.loadByPersonIds(personIds)) as any[] || []).filter((p) => p.churchId === churchId);
-    const overrides = ((await this.repos.notificationPreferenceOverride.loadByPersonIds(personIds)) as any[] || []).filter((o) => o.churchId === churchId);
+    const prefs = ((await this.repos.notificationPreference.loadByPersonIds(personIds)) || []).filter((p) => p.churchId === churchId);
+    const overrides = ((await this.repos.notificationPreferenceOverride.loadByPersonIds(personIds)) || []).filter((o) => o.churchId === churchId);
     const body = this.smsBody(church?.name || "", message);
     let noProvider = false;
+    let textsSent = 0;
     for (const personId of personIds) {
       let status = "sent";
       let reason: string | undefined;
@@ -208,7 +260,7 @@ export class ReminderEngine {
         const gate = PreferenceGateHelper.evaluate(churchId, personId, occ.category || "", "sms", { pref, overrides: overrides.filter((o) => o.personId === personId), churchTimeZone: church?.timeZone });
         const person = gate.allow && !noProvider ? await membership.loadPerson(churchId, personId) : null;
         const phoneNumber = (person?.mobilePhone || "").trim();
-        const optedOut = person?.optedOut === true || person?.optedOut === 1;
+        const optedOut = person?.smsOptedOut === true || person?.smsOptedOut === 1;
         reason = !gate.allow ? gate.reason : noProvider ? "no_provider" : !phoneNumber ? "no_phone" : optedOut ? "opted_out" : undefined;
         if (reason) status = "suppressed";
         else {
@@ -236,7 +288,9 @@ export class ReminderEngine {
         reason: reason?.slice(0, 40),
         idempotencyKey: crypto.createHash("sha256").update(`${occ.entityType}:${occ.id}:${personId}:sms`).digest("hex")
       });
+      if (status === "sent") textsSent++;
     }
+    return { textsSent, textsSkipped: personIds.length - textsSent };
   }
 
   static async cancelEntity(churchId: string, entityType: string, entityId: string): Promise<void> {
@@ -266,7 +320,7 @@ export class ReminderEngine {
   // occurrences in sync without waiting for midnight. event.* and plan.*/task.*
   // arrive via WebhookDispatcher.emit / InternalEventBus.publish respectively.
   // Bound at the subscription site (index.ts) so `this` resolves to the class.
-  static async handleBusEvent(churchId: string, event: string, payload: any): Promise<void> {
+  static async handleBusEvent(churchId: string, event: string, payload: { id?: string; planTypeId?: string } | null | undefined): Promise<void> {
     if (!this.repos) return;
     const id = payload?.id;
     if (!id) return;

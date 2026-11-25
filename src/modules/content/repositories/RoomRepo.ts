@@ -2,6 +2,7 @@ import { UniqueIdHelper } from "@churchapps/apihelper";
 import { getDb } from "../db/index.js";
 import { Room } from "../models/index.js";
 import { injectable } from "inversify";
+import type { TinyIntActive } from "./types.js";
 
 @injectable()
 export class RoomRepo {
@@ -17,8 +18,10 @@ export class RoomRepo {
       name: model.name,
       description: model.description,
       capacity: model.capacity,
-      approvalGroupId: model.approvalGroupId
-    } as any).execute();
+      approvalGroupId: model.approvalGroupId,
+      active: model.active ?? true,
+      categoryName: model.categoryName?.trim() || null
+    }).execute();
     return model;
   }
 
@@ -27,8 +30,10 @@ export class RoomRepo {
       name: model.name,
       description: model.description,
       capacity: model.capacity,
-      approvalGroupId: model.approvalGroupId ?? null
-    } as any).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
+      approvalGroupId: model.approvalGroupId ?? null,
+      active: model.active ?? true,
+      categoryName: model.categoryName?.trim() || null
+    }).where("id", "=", model.id).where("churchId", "=", model.churchId).execute();
     return model;
   }
 
@@ -37,18 +42,24 @@ export class RoomRepo {
   }
 
   public async load(churchId: string, id: string): Promise<Room | undefined> {
-    return (await getDb().selectFrom("rooms").selectAll().where("id", "=", id).where("churchId", "=", churchId).executeTakeFirst()) ?? null;
+    const row = await getDb().selectFrom("rooms").selectAll().where("id", "=", id).where("churchId", "=", churchId).executeTakeFirst();
+    return row ? this.convertToModel(churchId, row) : null;
   }
 
   public async loadAll(churchId: string): Promise<Room[]> {
-    return getDb().selectFrom("rooms").selectAll().where("churchId", "=", churchId).orderBy("name").execute() as any;
+    return this.convertAllToModel(churchId, await getDb().selectFrom("rooms").selectAll().where("churchId", "=", churchId).orderBy("name").execute());
   }
 
   public async loadByIds(churchId: string, ids: string[]): Promise<Room[]> {
     if (ids.length === 0) return [];
-    return getDb().selectFrom("rooms").selectAll().where("churchId", "=", churchId).where("id", "in", ids).execute() as any;
+    return this.convertAllToModel(churchId, await getDb().selectFrom("rooms").selectAll().where("churchId", "=", churchId).where("id", "in", ids).execute());
   }
 
-  public convertToModel(_churchId: string, data: any) { return data as Room; }
-  public convertAllToModel(_churchId: string, data: any[]) { return (data || []) as Room[]; }
+  // MySQL returns TINYINT(1) as 0/1.
+  public convertToModel(_churchId: string, data: TinyIntActive<Room>) {
+    if (!data) return data as Room;
+    return { ...data, active: data.active === undefined ? true : !!data.active } as Room;
+  }
+
+  public convertAllToModel(churchId: string, data: TinyIntActive<Room>[]) { return (data || []).map((d) => this.convertToModel(churchId, d)); }
 }

@@ -1,6 +1,6 @@
 import { ALL_WEBHOOK_EVENTS } from "./WebhookEvents.js";
 
-const SAMPLES: Record<string, (churchId: string) => any> = {
+const SAMPLES: Record<string, (churchId: string) => Record<string, unknown>> = {
   "person.created": (churchId) => ({ id: "smpl_person", churchId, name: { display: "Sample Person", first: "Sample", last: "Person" }, contactInfo: { email: "sample@example.com" } }),
   "person.updated": (churchId) => ({ id: "smpl_person", churchId, name: { display: "Sample Person", first: "Sample", last: "Person" }, contactInfo: { email: "sample@example.com" } }),
   "person.destroyed": (churchId) => ({ id: "smpl_person", churchId }),
@@ -27,6 +27,7 @@ const SAMPLES: Record<string, (churchId: string) => any> = {
 
   "form.submission.created": (churchId) => ({ id: "smpl_formsubmission", churchId, formId: "smpl_form", formName: "Sample Form", contentType: "person", contentId: "smpl_person", personName: "Sample Person" }),
   "registration.created": (churchId) => ({ id: "smpl_registration", churchId, eventId: "smpl_event", members: [{ personId: "smpl_person", name: "Sample Person" }] }),
+  "registration.cancelled": (churchId) => ({ id: "smpl_registration", churchId, eventId: "smpl_event", personId: "smpl_person", status: "cancelled", cancelledDate: new Date().toISOString(), members: [{ personId: "smpl_person", name: "Sample Person" }] }),
   "list.member.added": (churchId) => ({ churchId, listId: "smpl_list", listName: "Sample List", personId: "smpl_person", personName: "Sample Person" }),
   "list.member.removed": (churchId) => ({ churchId, listId: "smpl_list", listName: "Sample List", personId: "smpl_person", personName: "Sample Person" }),
 
@@ -35,7 +36,7 @@ const SAMPLES: Record<string, (churchId: string) => any> = {
   "event.destroyed": (churchId) => ({ id: "smpl_event", churchId })
 };
 
-export const samplePayloadFor = (event: string, churchId: string): any => {
+export const samplePayloadFor = (event: string, churchId: string): Record<string, unknown> => {
   return (SAMPLES[event] ?? ((cid: string) => ({ id: "smpl_sample", churchId: cid })))(churchId);
 };
 

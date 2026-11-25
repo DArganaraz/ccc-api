@@ -3,6 +3,7 @@ jest.mock("../../Environment", () => ({ Environment: { membershipApi: "http://te
 import { PayPalHelper } from "../../PayPalHelper";
 import { PayPalGatewayProvider } from "../PayPalGatewayProvider";
 import { GatewayConfig } from "../IGatewayProvider";
+import type { Donation, FundDonation } from "../../../../modules/giving/models";
 
 describe("PayPalGatewayProvider", () => {
   const provider = new PayPalGatewayProvider();
@@ -39,8 +40,8 @@ describe("PayPalGatewayProvider", () => {
     const makeRepos = () => ({
       customer: { load: jest.fn().mockResolvedValue(null) },
       donationBatch: { getOrCreateCurrent: jest.fn().mockResolvedValue({ id: "BAT1" }) },
-      donation: { save: jest.fn().mockImplementation(async (d: any) => ({ ...d, id: "DON1" })) },
-      fundDonation: { save: jest.fn().mockImplementation(async (f: any) => f) },
+      donation: { save: jest.fn().mockImplementation(async (d: Donation) => ({ ...d, id: "DON1" })) },
+      fundDonation: { save: jest.fn().mockImplementation(async (f: FundDonation) => f) },
       fund: { getOrCreateGeneral: jest.fn().mockResolvedValue({ id: "GEN" }) }
     });
 
@@ -54,6 +55,15 @@ describe("PayPalGatewayProvider", () => {
       expect(saved.personId).toBe("PER1");
       expect(repos.donation.save.mock.calls[0][1]).toEqual([{ churchId: "CHU1", fundId: "F1", amount: 25 }]);
       expect(repos.fund.getOrCreateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("stores the donor's note as the memo, not in internal notes", async () => {
+      const repos = makeRepos();
+      const capture = { id: "CAP2", status: "COMPLETED", amount: { value: "25.00", currency_code: "USD" }, create_time: "2026-09-01T00:00:00Z" };
+      await provider.logDonation(config, "CHU1", { ...capture, amount: 25, person: { id: "PER1" }, funds: [{ id: "F1", amount: 25 }], notes: "Youth trip" }, repos);
+      const saved = repos.donation.save.mock.calls[0][0];
+      expect(saved.memo).toBe("Youth trip");
+      expect(saved.notes).not.toBe("Youth trip");
     });
 
     it("reads the amount from a webhook capture and falls back to the General Fund", async () => {

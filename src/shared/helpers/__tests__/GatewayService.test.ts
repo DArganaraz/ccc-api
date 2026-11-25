@@ -5,6 +5,7 @@ jest.mock("../../../modules/giving/repositories/GatewayRepo", () => ({ GatewayRe
 import { GatewayService } from "../GatewayService";
 import { GatewayFactory } from "../gateways";
 import { EncryptionHelper } from "@churchapps/apihelper";
+import type { Gateway } from "../../../modules/giving/models";
 
 // Mock dependencies
 jest.mock("../gateways", () => ({ GatewayFactory: { getProvider: jest.fn() } }));
@@ -145,18 +146,18 @@ describe("GatewayService", () => {
   });
 
   describe("getGatewayForChurch", () => {
-    const createRepo = (gateways: any[]) => ({ loadAll: jest.fn().mockResolvedValue(gateways) });
+    const createRepo = (gateways: Gateway[]) => ({ loadAll: jest.fn().mockResolvedValue(gateways) });
 
     it("should throw when churchId is missing", async () => {
       const repo = createRepo([]);
-      await expect(GatewayService.getGatewayForChurch("", {}, repo as any)).rejects.toThrow(
+      await expect(GatewayService.getGatewayForChurch("", {}, repo)).rejects.toThrow(
         "churchId is required"
       );
     });
 
     it("should throw when no gateways are configured", async () => {
       const repo = createRepo([]);
-      await expect(GatewayService.getGatewayForChurch("church1", {}, repo as any)).rejects.toThrow(
+      await expect(GatewayService.getGatewayForChurch("church1", {}, repo)).rejects.toThrow(
         "No payment gateway configured"
       );
     });
@@ -171,7 +172,7 @@ describe("GatewayService", () => {
       const result = await GatewayService.getGatewayForChurch(
         "church1",
         { gatewayId: "gateway2" },
-        repo as any
+        repo
       );
 
       expect(result).toMatchObject({ id: "gateway2", provider: "paypal", environment: "production" });
@@ -182,7 +183,7 @@ describe("GatewayService", () => {
       const repo = createRepo([{ id: "gateway1", provider: "stripe", environment: "test" }]);
 
       await expect(
-        GatewayService.getGatewayForChurch("church1", { gatewayId: "missing" }, repo as any)
+        GatewayService.getGatewayForChurch("church1", { gatewayId: "missing" }, repo)
       ).rejects.toThrow("Gateway missing is not configured");
     });
 
@@ -193,7 +194,7 @@ describe("GatewayService", () => {
       ];
       const repo = createRepo(gateways);
 
-      const result = await GatewayService.getGatewayForChurch("church1", { provider: "stripe" }, repo as any);
+      const result = await GatewayService.getGatewayForChurch("church1", { provider: "stripe" }, repo);
 
       expect(result).toMatchObject({ id: "gateway2", provider: "stripe", environment: "production" });
     });
@@ -206,7 +207,7 @@ describe("GatewayService", () => {
       const repo = createRepo(gateways);
 
       await expect(
-        GatewayService.getGatewayForChurch("church1", { provider: "stripe" }, repo as any)
+        GatewayService.getGatewayForChurch("church1", { provider: "stripe" }, repo)
       ).rejects.toThrow("Multiple stripe payment gateways");
     });
 
@@ -214,7 +215,7 @@ describe("GatewayService", () => {
       const gateways = [{ id: "gateway1", provider: "Stripe", environment: "sandbox" }];
       const repo = createRepo(gateways);
 
-      const result = await GatewayService.getGatewayForChurch("church1", { provider: "stripe" }, repo as any);
+      const result = await GatewayService.getGatewayForChurch("church1", { provider: "stripe" }, repo);
       expect(result).toMatchObject({ id: "gateway1", provider: "Stripe" });
     });
 
@@ -222,7 +223,7 @@ describe("GatewayService", () => {
       const repo = createRepo([{ id: "gateway1", provider: "stripe", environment: "test" }]);
 
       await expect(
-        GatewayService.getGatewayForChurch("church1", { provider: "square" }, repo as any)
+        GatewayService.getGatewayForChurch("church1", { provider: "square" }, repo)
       ).rejects.toThrow("No square gateway configured");
     });
 
@@ -233,7 +234,7 @@ describe("GatewayService", () => {
       ];
       const repo = createRepo(gateways);
 
-      const result = await GatewayService.getGatewayForChurch("church1", {}, repo as any);
+      const result = await GatewayService.getGatewayForChurch("church1", {}, repo);
       expect(result).toMatchObject({ id: "gateway2", provider: "paypal" });
     });
 
@@ -244,7 +245,7 @@ describe("GatewayService", () => {
       ];
       const repo = createRepo(gateways);
 
-      await expect(GatewayService.getGatewayForChurch("church1", {}, repo as any)).rejects.toThrow(
+      await expect(GatewayService.getGatewayForChurch("church1", {}, repo)).rejects.toThrow(
         "Multiple payment gateways"
       );
     });
@@ -345,6 +346,32 @@ describe("GatewayService", () => {
       expect(mockConsoleWarn).not.toHaveBeenCalled();
       expect(mockConsoleInfo).not.toHaveBeenCalled();
       expect(mockConsoleDebug).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("activeSubscriptionIdsUsingMethod", () => {
+    const gateway = { id: "GAT1", churchId: "CHU1", provider: "kingdomfunding", privateKey: "k" } as Gateway;
+
+    it("uses the provider's own lookup when it has one", async () => {
+      const activeSubscriptionIdsUsingMethod = jest.fn().mockResolvedValue(["sub_1"]);
+      (GatewayFactory.getProvider as jest.Mock).mockReturnValue({ activeSubscriptionIdsUsingMethod });
+      expect(await GatewayService.activeSubscriptionIdsUsingMethod(gateway, "pm_1", "cus_1")).toEqual(["sub_1"]);
+      expect(activeSubscriptionIdsUsingMethod).toHaveBeenCalledWith(expect.anything(), "pm_1", "cus_1");
+    });
+
+    it("otherwise matches the customer's listed recurring gifts by default_payment_method", async () => {
+      const listNormalizedSubscriptions = jest.fn().mockResolvedValue([
+        { id: "s1", default_payment_method: "123" },
+        { id: "s2", default_payment_method: "456" }
+      ]);
+      (GatewayFactory.getProvider as jest.Mock).mockReturnValue({ listNormalizedSubscriptions });
+      expect(await GatewayService.activeSubscriptionIdsUsingMethod(gateway, "123", "cus_1")).toEqual(["s1"]);
+      expect(listNormalizedSubscriptions).toHaveBeenCalledWith(expect.anything(), "cus_1");
+    });
+
+    it("returns null when the provider can't list recurring gifts", async () => {
+      (GatewayFactory.getProvider as jest.Mock).mockReturnValue({});
+      expect(await GatewayService.activeSubscriptionIdsUsingMethod(gateway, "pm_1", "cus_1")).toBeNull();
     });
   });
 });

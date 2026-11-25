@@ -4,6 +4,21 @@ import { InternalEventBus } from "../../../shared/events/InternalEventBus.js";
 import { Task } from "../models/index.js";
 import { Repos } from "../repositories/index.js";
 import { Environment } from "./Environment.js";
+import { MAX_PHOTO_BYTES, PhotoDataUrl } from "../../../shared/helpers/PhotoDataUrl.js";
+
+// One requested change in a directoryUpdate task's data array.
+interface DirectoryUpdateField {
+  field?: string;
+  label?: string;
+  value?: unknown;
+}
+
+// Published with sso.photoSubmitted by the membership module.
+interface PhotoSubmittedPayload {
+  personId?: string;
+  dataUrl?: string;
+  assignedTo?: { type: string; id: string };
+}
 
 export class DirectoryUpdateHelper {
   private static async savePhoto(churchId: string, base64Str: string, personId: string): Promise<string> {
@@ -15,12 +30,20 @@ export class DirectoryUpdateHelper {
     return Environment.contentRoot + key + "?dt=" + photoUpdated.getTime().toString();
   }
 
-  static maxPhotoBytes = 5 * 1024 * 1024;
+  static maxPhotoBytes = MAX_PHOTO_BYTES;
 
   static isAcceptablePhoto(dataUrl: string): boolean {
-    const match = /^data:image\/(png|jpeg|jpg|webp);base64,/i.exec(dataUrl);
-    if (!match) return false;
-    return (dataUrl.length - match[0].length) * 0.75 <= this.maxPhotoBytes;
+    return PhotoDataUrl.isAcceptable(dataUrl);
+  }
+
+  // A family member the member asked to add can carry a photo; it waits in the pending folder like their own.
+  private static async parkFamilyMemberPhoto(churchId: string, value: string, personId: string, index: number): Promise<string> {
+    let member: { photo?: unknown } | null;
+    try { member = JSON.parse(value); } catch { return value; }
+    if (!member || typeof member !== "object" || typeof member.photo !== "string" || !member.photo.startsWith("data:")) return value;
+    if (this.isAcceptablePhoto(member.photo)) member.photo = await this.savePhoto(churchId, member.photo, personId + "-family-" + index);
+    else delete member.photo;
+    return JSON.stringify(member);
   }
 
   // Rewrites any inline photo data URL in an Open directoryUpdate task to a stored file URL.
@@ -35,12 +58,13 @@ export class DirectoryUpdateHelper {
           }
         })()
         : [];
-      const kept: any[] = [];
-      for (const d of Array.isArray(data) ? data : []) {
+      const kept: DirectoryUpdateField[] = [];
+      for (const d of (Array.isArray(data) ? data : []) as DirectoryUpdateField[]) {
         if (d?.field === "photo" && typeof d.value === "string" && d.value.startsWith("data:")) {
           if (!this.isAcceptablePhoto(d.value)) continue;
           d.value = await this.savePhoto(churchId, d.value, task.associatedWithId);
         }
+        if (d?.field === "familyMember" && typeof d.value === "string") d.value = await this.parkFamilyMemberPhoto(churchId, d.value, task.associatedWithId, kept.length);
         kept.push(d);
       }
       task.data = JSON.stringify(kept);
@@ -73,9 +97,10 @@ export class DirectoryUpdateHelper {
 
   // Bus subscriber: the membership module publishes "sso.photoSubmitted" after an SSO
   // login so the photo enters the same staff-approval flow as member self-service.
-  public static onEvent = async (churchId: string, event: string, payload: any): Promise<void> => {
+  public static onEvent = async (churchId: string, event: string, payload: unknown): Promise<void> => {
     if (event !== "sso.photoSubmitted") return;
-    if (!payload?.personId || !payload?.dataUrl) return;
-    await DirectoryUpdateHelper.createPhotoTask(churchId, payload.personId, payload.dataUrl, payload.assignedTo);
+    const photo = payload as PhotoSubmittedPayload | null;
+    if (!photo?.personId || !photo?.dataUrl) return;
+    await DirectoryUpdateHelper.createPhotoTask(churchId, photo.personId, photo.dataUrl, photo.assignedTo);
   };
 }

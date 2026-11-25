@@ -2,7 +2,9 @@ import { getProvider, ContentProviderAuthData, Instructions, InstructionItem } f
 import { NotificationService } from "../../../shared/helpers/NotificationService.js";
 import { getMembershipModuleGateway } from "../../../shared/modules/index.js";
 import { Plan, PlanItem } from "../models/index.js";
+import { Repos } from "../repositories/index.js";
 import { ProviderAuthHelper } from "./ProviderAuthHelper.js";
+import { AppUrlHelper } from "../../../shared/helpers/AppUrlHelper.js";
 
 // A plan type's saved lesson trim (#1401): the parts of a lesson kept in one hand-customized plan, re-applied by name
 // (and, for a part inside a section, by position) to every lesson scheduled into that plan type. Provider-neutral:
@@ -243,7 +245,7 @@ export class LessonTrimHelper {
     return { rows, notes, misses };
   }
 
-  public static async loadInstructions(repos: any, churchId: string, plan: Plan): Promise<Instructions | null> {
+  public static async loadInstructions(repos: Repos, churchId: string, plan: Plan): Promise<Instructions | null> {
     if (!plan.providerId || !plan.providerPlanId) return null;
     const provider = getProvider(plan.providerId) as unknown as ProviderLike | null;
     if (!provider?.getInstructions || provider.authTypes?.includes("network_discovery")) return null;
@@ -255,7 +257,7 @@ export class LessonTrimHelper {
 
   // Trims a lesson-linked plan to its plan type's saved trim. Skips plans that already have an order of service unless forced.
   // Never throws: a provider failure becomes the plan's warning, and the lesson plays whole.
-  public static async apply(repos: any, churchId: string, plan: Plan, opts: { force?: boolean } = {}): Promise<LessonTrimResult | null> {
+  public static async apply(repos: Repos, churchId: string, plan: Plan, opts: { force?: boolean } = {}): Promise<LessonTrimResult | null> {
     if (!plan?.id || !plan.planTypeId || !plan.providerId || !plan.providerPlanId) return null;
     const planType = await repos.planType.load(churchId, plan.planTypeId);
     const trim = this.parse(planType?.lessonTrim);
@@ -287,7 +289,7 @@ export class LessonTrimHelper {
     return { planId: plan.id, name: plan.name, serviceDate: plan.serviceDate, warning: stored };
   }
 
-  private static async saveTree(repos: any, churchId: string, planId: string, rows: PlanItem[], parentId?: string): Promise<void> {
+  private static async saveTree(repos: Repos, churchId: string, planId: string, rows: PlanItem[], parentId?: string): Promise<void> {
     for (let i = 0; i < rows.length; i++) {
       const { children, ...row } = rows[i];
       const saved = await repos.planItem.save({ ...row, churchId, planId, parentId, sort: i + 1 });
@@ -302,7 +304,7 @@ export class LessonTrimHelper {
       const leaderIds = await gateway.loadGroupLeaderPersonIds(churchId, plan.ministryId);
       if (leaderIds.length === 0) return;
       const church = await gateway.loadChurch(churchId);
-      const planUrl = `https://${church?.subDomain || "app"}.b1.church/mobile/plans/${plan.id}`;
+      const planUrl = AppUrlHelper.b1AppUrl(church?.subDomain || "app") + `/mobile/plans/${plan.id}`;
       await NotificationService.createNotifications(leaderIds, churchId, "plan", plan.id, `${plan.name}: ${warning}`.slice(0, 500), planUrl);
     } catch (e) {
       console.error("Lesson trim notification failed:", e);

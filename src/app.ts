@@ -13,6 +13,7 @@ import { configureModuleRoutes, moduleRoutingLogger } from "./routes.js";
 import { isPublicDiskFilePath } from "./modules/content/helpers/PublicFileAccess.js";
 import { statusFromError } from "./shared/helpers/httpError.js";
 import { slowRequestLogger } from "./shared/helpers/SlowRequestLogger.js";
+import type { Repos as MessagingRepos } from "./modules/messaging/repositories/index.js";
 
 export const createApp = async () => {
   const environment = process.env.ENVIRONMENT || "dev";
@@ -50,7 +51,7 @@ export const createApp = async () => {
         const contentType = req.headers["content-type"] || "";
         const isWebhookEndpoint = req.path.includes("/donate/webhook/");
 
-        (req as any)._body = true;
+        (req as express.Request & { _body?: boolean })._body = true;
 
         if (Buffer.isBuffer(req.body)) {
           try {
@@ -97,21 +98,11 @@ export const createApp = async () => {
       app.use(bodyParser.urlencoded({ extended: true, limit: "50mb" }));
     }
 
-    // Only the disk-store commons and gallery uploads read req.files; everywhere else multipart would just fill /tmp.
+    // Only the disk-store commons upload reads req.files; everywhere else multipart would just fill /tmp.
     app.use(
       "/commons/submissions/:id/upload",
       fileUpload({
         limits: { fileSize: 50 * 1024 * 1024, files: 1 },
-        abortOnLimit: true,
-        useTempFiles: true,
-        tempFileDir: "/tmp/"
-      }),
-      removeTempFilesAfterResponse
-    );
-    app.use(
-      "/content/gallery/upload",
-      fileUpload({
-        limits: { fileSize: 15 * 1024 * 1024, files: 1 },
         abortOnLimit: true,
         useTempFiles: true,
         tempFileDir: "/tmp/"
@@ -159,7 +150,7 @@ export const createApp = async () => {
   });
 
   server.setErrorConfig((app) => {
-    app.use((error: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    app.use((error: Error & { code?: string | number }, req: express.Request, res: express.Response, _next: express.NextFunction) => {
       const statusCode = statusFromError(error);
       if (statusCode >= 500) {
         console.error("Unhandled error:", {
@@ -202,30 +193,30 @@ export const createApp = async () => {
     const routes = buildRouteInventory();
     console.log(`📡 MCP server ready at /mcp — ${routes.length} routes in inventory`);
   } catch (error) {
-    console.warn("Failed to initialize MCP module:", (error as any)?.message || error);
+    console.warn("Failed to initialize MCP module:", (error as Error | undefined)?.message || error);
   }
 
   try {
     const { initializeMessagingModule } = await import("./modules/messaging/index.js");
     const { RepoManager } = await import("./shared/infrastructure/RepoManager.js");
-    const messagingRepos = await RepoManager.getRepos<any>("messaging");
+    const messagingRepos = await RepoManager.getRepos<MessagingRepos>("messaging");
     initializeMessagingModule(messagingRepos);
   } catch (error) {
-    console.warn("Failed to initialize messaging module:", (error as any)?.message || error);
+    console.warn("Failed to initialize messaging module:", (error as Error | undefined)?.message || error);
   }
 
   try {
     const { initializeDoingModule } = await import("./modules/doing/index.js");
     initializeDoingModule();
   } catch (error) {
-    console.warn("Failed to initialize doing module:", (error as any)?.message || error);
+    console.warn("Failed to initialize doing module:", (error as Error | undefined)?.message || error);
   }
   return app;
 };
 
 export function removeTempFilesAfterResponse(req: express.Request, res: express.Response, next: express.NextFunction) {
   res.on("close", () => {
-    const files = (req as any).files as Record<string, { tempFilePath?: string } | { tempFilePath?: string }[]> | undefined;
+    const files = req.files as Record<string, { tempFilePath?: string } | { tempFilePath?: string }[]> | undefined;
     if (!files) return;
     for (const entry of Object.values(files).flat()) {
       if (entry?.tempFilePath) fs.promises.unlink(entry.tempFilePath).catch(() => {});
@@ -238,7 +229,7 @@ async function loadModuleBindings(container: Container) {
   try {
     const startTime = Date.now();
 
-    const moduleImports: Array<{ name: string; import: Promise<any> }> = [
+    const moduleImports: Array<{ name: string; import: Promise<unknown> }> = [
       { name: "Shared", import: import("./shared/controllers/HealthController.js") },
       { name: "Membership", import: import("./modules/membership/controllers/index.js") },
       { name: "Attendance", import: import("./modules/attendance/controllers/index.js") },
@@ -262,7 +253,7 @@ async function loadModuleBindings(container: Container) {
     results.forEach((result, index) => {
       const moduleName = moduleImports[index].name;
       if (result.status !== "fulfilled") {
-        console.error(`Failed to load ${moduleName} controllers:`, (result as any).reason);
+        console.error(`Failed to load ${moduleName} controllers:`, result.reason);
       }
     });
 

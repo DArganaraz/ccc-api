@@ -1,20 +1,23 @@
 import { GRADES } from "./GradeMapping.js";
+import { PhotoDataUrl } from "../../../shared/helpers/PhotoDataUrl.js";
 
 export type GuestFieldMode = "off" | "optional" | "required";
 export const GUEST_FIELD_KEYS = [
-  "title", "email", "phone", "householdRole", "address", "birthDate", "gender", "maritalStatus", "grade", "comments"
+  "title", "email", "phone", "householdRole", "address", "birthDate", "gender", "maritalStatus", "grade", "comments", "photo"
 ] as const;
 export type GuestFieldKey = (typeof GUEST_FIELD_KEYS)[number];
 export type GuestFieldModes = Record<GuestFieldKey, GuestFieldMode>;
 
-export const DEFAULT_GUEST_FIELDS: GuestFieldModes = { title: "off", email: "optional", phone: "optional", householdRole: "optional", address: "off", birthDate: "off", gender: "off", maritalStatus: "off", grade: "off", comments: "off" };
+export const DEFAULT_GUEST_FIELDS: GuestFieldModes = { title: "off", email: "optional", phone: "optional", householdRole: "optional", address: "off", birthDate: "off", gender: "off", maritalStatus: "off", grade: "off", comments: "off", photo: "off" };
 export const GUEST_GENDERS = ["Unspecified", "Male", "Female"];
 // The first person heads a new household, so the role is asked of everyone after them.
 export const GUEST_HOUSEHOLD_ROLES = ["Spouse", "Child", "Other"];
 export const GUEST_MARITAL_STATUSES = ["Unknown", "Single", "Married", "Divorced", "Widowed"];
 
-export interface GuestMember { title?: string; firstName: string; lastName: string; email?: string; phone?: string; householdRole?: string; birthDate?: string; gender?: string; grade?: string }
+export interface GuestMember { title?: string; firstName: string; lastName: string; email?: string; phone?: string; householdRole?: string; birthDate?: string; gender?: string; grade?: string; photo?: string }
 export interface GuestAddress { address1?: string; address2?: string; city?: string; state?: string; zip?: string }
+/** Untrusted request body for a guest registration, before sanitize(). */
+export interface GuestRegistrationBody { members?: Partial<Record<keyof GuestMember, unknown>>[]; address?: Partial<Record<keyof GuestAddress, unknown>>; maritalStatus?: unknown; comments?: unknown }
 export interface GuestRegistration { members: GuestMember[]; address?: GuestAddress; maritalStatus?: string; comments?: string }
 
 const MODES: GuestFieldMode[] = ["off", "optional", "required"];
@@ -27,7 +30,7 @@ export class GuestRegistrationHelper {
   static parseModes(raw: string | undefined | null): GuestFieldModes {
     const result: GuestFieldModes = { ...DEFAULT_GUEST_FIELDS };
     if (!raw) return result;
-    let parsed: any = null;
+    let parsed: Partial<Record<GuestFieldKey, GuestFieldMode>> = null;
     try { parsed = JSON.parse(raw); } catch { return result; }
     if (!parsed || typeof parsed !== "object") return result;
     GUEST_FIELD_KEYS.forEach((k) => { if (MODES.includes(parsed[k])) result[k] = parsed[k]; });
@@ -47,8 +50,8 @@ export class GuestRegistrationHelper {
   }
 
   // Keeps only the fields the church included, and rejects missing required or unknown values.
-  static sanitize(body: any, modes: GuestFieldModes): { error?: string; registration?: GuestRegistration } {
-    const rawMembers: any[] = body?.members;
+  static sanitize(body: GuestRegistrationBody, modes: GuestFieldModes): { error?: string; registration?: GuestRegistration } {
+    const rawMembers = body?.members;
     const on = (k: GuestFieldKey) => modes[k] !== "off";
     const required = (k: GuestFieldKey) => modes[k] === "required";
 
@@ -66,11 +69,11 @@ export class GuestRegistrationHelper {
       const phone = clean(m.phone, 21);
       if (on("phone") && phone) member.phone = phone;
       else if (i === 0 && required("phone")) return { error: "phone is required" };
-      if (i === 0) {
-        const email = clean(m.email, 100);
-        if (on("email") && email) member.email = email;
-        else if (required("email")) return { error: "email is required" };
-      } else if (on("householdRole")) {
+      // Everyone can give an email; only the first person is ever required to.
+      const email = clean(m.email, 100);
+      if (on("email") && email) member.email = email;
+      else if (i === 0 && required("email")) return { error: "email is required" };
+      if (i > 0 && on("householdRole")) {
         // An unknown role is dropped, so the person is filed as Other as before.
         const role = clean(m.householdRole, 10);
         if (GUEST_HOUSEHOLD_ROLES.includes(role)) member.householdRole = role;
@@ -96,6 +99,13 @@ export class GuestRegistrationHelper {
           if (!GRADES.includes(grade)) return { error: "grade is not valid" };
           member.grade = grade;
         } else if (required("grade")) return { error: "grade is required for each member" };
+      }
+      // A PNG data URL, cropped in the browser; stored as the new person's profile photo.
+      if (on("photo")) {
+        if (m.photo) {
+          if (!PhotoDataUrl.isAcceptable(m.photo, true)) return { error: "photo is not valid" };
+          member.photo = m.photo as string;
+        } else if (i === 0 && required("photo")) return { error: "photo is required" };
       }
       members.push(member);
     }

@@ -1,11 +1,12 @@
 import { ArrayHelper, EmailHelper } from "@churchapps/apihelper";
-import { Conversation, DeliveryLog, Device, Message, PrivateMessage, Notification, NotificationPreference, NotificationPreferenceOverride } from "../models/index.js";
+import { Conversation, DeliveryLog, Device, Message, PrivateMessage, Notification, NotificationPreference, NotificationPreferenceOverride, NotificationEntityMute } from "../models/index.js";
 import { Repos } from "../repositories/index.js";
 import { DeliveryHelper } from "./DeliveryHelper.js";
 import { ExpoPushHelper } from "./ExpoPushHelper.js";
 import { WebPushHelper } from "./WebPushHelper.js";
 import { NotificationCategoryHelper } from "./NotificationCategoryHelper.js";
 import { PreferenceGateHelper } from "./PreferenceGateHelper.js";
+import { ForeignPersonRow, MembershipRepos } from "./ForeignRepos.js";
 import axios from "axios";
 import { Environment } from "../../../shared/helpers/Environment.js";
 import { RepoManager } from "../../../shared/infrastructure/RepoManager.js";
@@ -175,7 +176,7 @@ export class NotificationHelper {
     const [overrides, entityMutes] = (await Promise.all([
       NotificationHelper.repos.notificationPreferenceOverride.loadForPerson(churchId, personId),
       needMutes ? NotificationHelper.repos.notificationEntityMute.loadForPerson(churchId, personId) : Promise.resolve([])
-    ])) as [NotificationPreferenceOverride[], any[]];
+    ])) as [NotificationPreferenceOverride[], NotificationEntityMute[]];
     const gateCtx = {
       pref,
       overrides: overrides || [],
@@ -204,13 +205,13 @@ export class NotificationHelper {
       ]);
       this.addDebugStep(debugTrace, "delivery-load-socket-connections", "ok", {
         connectionCount: connections.length,
-        notificationCount: Number((countsRaw as any)?.notificationCount) || 0,
-        pmCount: Number((countsRaw as any)?.pmCount) || 0
+        notificationCount: Number(countsRaw?.notificationCount) || 0,
+        pmCount: Number(countsRaw?.pmCount) || 0
       });
       if (connections.length > 0) {
         const counts = {
-          notificationCount: Number((countsRaw as any)?.notificationCount) || 0,
-          pmCount: Number((countsRaw as any)?.pmCount) || 0
+          notificationCount: Number(countsRaw?.notificationCount) || 0,
+          pmCount: Number(countsRaw?.pmCount) || 0
         };
         const deliveryCount = await DeliveryHelper.sendMessages(connections, {
           churchId,
@@ -244,7 +245,7 @@ export class NotificationHelper {
         this.addDebugStep(debugTrace, "delivery-push-gated", "warn", { reason: pushGate.reason, decision: pushGate.decision });
       }
       if (pushGate.allow) {
-        const devices: Device[] = (await NotificationHelper.repos.device.loadForPerson(churchId, personId)) as any[];
+        const devices: Device[] = await NotificationHelper.repos.device.loadForPerson(churchId, personId);
         const allTokens = devices.map((device) => device.fcmToken).filter((token) => !!token) as string[];
         const expoPushTokens = [...new Set(allTokens.filter((token) => token.startsWith("ExponentPushToken[")))];
         const { activeTokens: webPushTokens, staleTokens: staleWebPushTokens, activeDevices: activeWebPushDevices } = this.prepareWebPushDevices(devices);
@@ -277,7 +278,7 @@ export class NotificationHelper {
         let anyPushSent = false;
 
         const badgeCountsRaw = await NotificationHelper.repos.notification.loadNewCounts(churchId, personId);
-        const badgeCount = (Number((badgeCountsRaw as any)?.notificationCount) || 0) + (Number((badgeCountsRaw as any)?.pmCount) || 0);
+        const badgeCount = (Number(badgeCountsRaw?.notificationCount) || 0) + (Number(badgeCountsRaw?.pmCount) || 0);
         const pushNavData = { ...(navData || {}), badgeCount };
 
         if (expoPushTokens.length > 0) {
@@ -286,9 +287,9 @@ export class NotificationHelper {
             await Promise.all(expoPushTokens.map((token, i) => {
               const ticket = tickets?.[i];
               const success = ticket?.status === "ok";
-              const errorMsg = ticket?.status === "error" ? (ticket as any).message : undefined;
+              const errorMsg = ticket?.status === "error" ? ticket.message : undefined;
               const logPromise = this.logDelivery(churchId, personId, contentType, contentId, "push", success, token, errorMsg);
-              if (ticket?.status === "error" && (ticket as any).details?.error === "DeviceNotRegistered") {
+              if (ticket?.status === "error" && ticket.details?.error === "DeviceNotRegistered") {
                 return Promise.all([logPromise, this.deleteInvalidToken(token)]);
               }
               return logPromise;
@@ -415,7 +416,7 @@ export class NotificationHelper {
 
     // Load notifications pending escalation. Direct-message rows (contentType
     // "privateMessage") now escalate here too, as ordinary notification rows.
-    const pendingNotifications: Notification[] = (await NotificationHelper.repos.notification.loadPendingEscalation()) as any[];
+    const pendingNotifications: Notification[] = await NotificationHelper.repos.notification.loadPendingEscalation();
     console.log("[NotificationHelper.escalateDelivery] Found " + pendingNotifications.length + " notifications pending escalation");
     for (const notification of pendingNotifications) {
       const currentLevel = notification.deliveryMethod === "socket" ? 0 : 1;
@@ -512,7 +513,7 @@ export class NotificationHelper {
 
         pm.notifyPersonId = pm.fromPersonId === senderPersonId ? pm.toPersonId : pm.fromPersonId;
         const recipientDevices = pm.notifyPersonId
-          ? await NotificationHelper.repos.device.loadForPerson(conversation.churchId, pm.notifyPersonId) as any[]
+          ? await NotificationHelper.repos.device.loadForPerson(conversation.churchId, pm.notifyPersonId)
           : [];
         console.debug("[chat-push] targets", {
           churchId: conversation.churchId,
@@ -554,8 +555,8 @@ export class NotificationHelper {
         });
 
         // Notifications row owns delivery state/escalation. Reuse existing unread row so consecutive messages share one escalation unit; every message pings socket.
-        const existingDmRows = (await NotificationHelper.repos.notification.loadExistingUnread(conversation.churchId, "privateMessage", pm.id)) as any[] || [];
-        let dmNotification: Notification = (existingDmRows || []).find((n: any) => n.personId === pm.notifyPersonId);
+        const existingDmRows = (await NotificationHelper.repos.notification.loadExistingUnread(conversation.churchId, "privateMessage", pm.id)) || [];
+        let dmNotification: Notification = (existingDmRows || []).find((n) => n.personId === pm.notifyPersonId);
         if (!dmNotification) {
           dmNotification = await NotificationHelper.repos.notification.save({
             churchId: conversation.churchId,
@@ -620,7 +621,7 @@ export class NotificationHelper {
           .map(([personId]) => personId)
           .filter((pid) => pid !== senderPersonId);
         const recipientDevices = subscribers.length > 0
-          ? ((await Promise.all(subscribers.map((personId) => NotificationHelper.repos.device.loadForPerson(conversation.churchId, personId)))) as any[][]).flat()
+          ? (await Promise.all(subscribers.map((personId) => NotificationHelper.repos.device.loadForPerson(conversation.churchId, personId)))).flat()
           : [];
         console.debug("[chat-push] targets", {
           churchId: conversation.churchId,
@@ -667,7 +668,7 @@ export class NotificationHelper {
 
     // Don't re-notify same event, except emailImmediate (reminders, staff "email all", workflow steps) where producers own dedup (ledger/intent).
     if (!options?.emailImmediate) {
-      const existing = (await NotificationHelper.repos.notification.loadExistingUnread(notifications[0].churchId, notifications[0].contentType, notifications[0].contentId)) as any[] || [];
+      const existing = (await NotificationHelper.repos.notification.loadExistingUnread(notifications[0].churchId, notifications[0].contentType, notifications[0].contentId)) || [];
       const suppressedPersonIds: string[] = [];
       for (let i = notifications.length - 1; i >= 0; i--) {
         if (existing.length > 0 && ArrayHelper.getAll(existing, "personId", notifications[i].personId).length > 0) {
@@ -688,7 +689,7 @@ export class NotificationHelper {
       const emailAddresses = new Map<string, string>();
       if (options?.emailImmediate) {
         const emailData = (await this.getEmailData(notifications.map((n) => ({ personId: n.personId }) as NotificationPreference))) || [];
-        emailData.forEach((e: any) => { if (e?.id && e?.email) emailAddresses.set(e.id, e.email); });
+        emailData.forEach((e) => { if (e?.id && e?.email) emailAddresses.set(e.id, e.email); });
       }
 
       const promises: Promise<Notification>[] = [];
@@ -740,7 +741,7 @@ export class NotificationHelper {
     if (!email) return;
 
     const pref = await NotificationHelper.repos.notificationPreference.loadByPersonId(notification.churchId, notification.personId);
-    const overrides = (await NotificationHelper.repos.notificationPreferenceOverride.loadForPerson(notification.churchId, notification.personId)) as any[] || [];
+    const overrides = (await NotificationHelper.repos.notificationPreferenceOverride.loadForPerson(notification.churchId, notification.personId)) || [];
     const gate = PreferenceGateHelper.evaluate(notification.churchId, notification.personId, notification.category || "", "email", { pref, overrides });
 
     if (!gate.allow) {
@@ -764,7 +765,7 @@ export class NotificationHelper {
     }
 
     try {
-      await EmailHelper.sendTemplatedEmail(await this.churchFrom(notification.churchId), email, "B1.church", "https://admin.b1.church", subject, html, "ChurchEmailTemplate.html");
+      await EmailHelper.sendTemplatedEmail(await this.churchFrom(notification.churchId), email, "B1.church", NotificationHelper.adminRoot(), subject, html, "ChurchEmailTemplate.html");
       if (reservationId) await ChurchEmailLimiter.settle(notification.churchId, reservationId, true);
       else await this.logDelivery(notification.churchId, notification.personId, "notification", notification.id, "email", true, email);
       notification.deliveryMethod = "complete";
@@ -787,13 +788,18 @@ export class NotificationHelper {
     const reservation = await ChurchEmailLimiter.reserve(churchId, "workflowEmail", [{ address: email, personId, contentId: taskId }]);
     if (!reservation) return "blocked (church email approval or daily limit)";
     try {
-      await EmailHelper.sendTemplatedEmail(await this.churchFrom(churchId), email, "B1.church", "https://admin.b1.church", subject, html, "ChurchEmailTemplate.html");
+      await EmailHelper.sendTemplatedEmail(await this.churchFrom(churchId), email, "B1.church", NotificationHelper.adminRoot(), subject, html, "ChurchEmailTemplate.html");
       await ChurchEmailLimiter.settle(churchId, reservation[0], true);
       return "sent";
     } catch (err) {
       await ChurchEmailLimiter.settle(churchId, reservation[0], false, String(err));
       throw err;
     }
+  }
+
+  // The install's own B1 Admin URL, so self-hosted emails link back to their domain.
+  private static adminRoot(): string {
+    return (Environment.b1AdminRoot || "https://admin.b1.church").replace(/\/$/, "");
   }
 
   // Sender shows the church's name; a failed lookup falls back to the bare support address.
@@ -809,7 +815,7 @@ export class NotificationHelper {
   // Legacy push paths (§4.5) route through gate so opt-outs/master-mute/quiet-hours honored.
   private static pushAllowed = async (churchId: string, personId: string, category: string): Promise<boolean> => {
     const pref = await NotificationHelper.repos.notificationPreference.loadByPersonId(churchId, personId);
-    const overrides = (await NotificationHelper.repos.notificationPreferenceOverride.loadForPerson(churchId, personId)) as any[] || [];
+    const overrides = (await NotificationHelper.repos.notificationPreferenceOverride.loadForPerson(churchId, personId)) || [];
     return PreferenceGateHelper.evaluate(churchId, personId, category, "push", { pref, overrides }).allow;
   };
 
@@ -829,7 +835,7 @@ export class NotificationHelper {
       if (deliveryCount > 0) method = "socket";
     }
 
-    const devices: Device[] = (await NotificationHelper.repos.device.loadForPerson(churchId, personId)) as any[];
+    const devices: Device[] = await NotificationHelper.repos.device.loadForPerson(churchId, personId);
 
     const allowPush = await this.pushAllowed(churchId, personId, NotificationCategoryHelper.categoryFor("notification"));
     if (devices.length > 0 && allowPush) {
@@ -879,11 +885,11 @@ export class NotificationHelper {
     this.ensureInitialized();
     console.log("[NotificationHelper.sendEmailNotifications] Repos initialized check passed (" + (Date.now() - startTime) + "ms)");
 
-    let promises: Promise<any>[] = [];
+    let promises: Promise<unknown>[] = [];
 
     // DMs now flow as notification rows (contentType "privateMessage"); no separate PM escalation queue.
     const rawNotifications = await NotificationHelper.repos.notification.loadUndelivered();
-    const allNotifications: Notification[] = (rawNotifications || []) as any[];
+    const allNotifications: Notification[] = rawNotifications || [];
     console.log("[NotificationHelper.sendEmailNotifications] Found " + allNotifications.length + " undelivered notifications");
 
     if (allNotifications.length === 0) {
@@ -894,7 +900,7 @@ export class NotificationHelper {
     const peopleIds = ArrayHelper.getIds(allNotifications, "personId");
     console.log("[NotificationHelper.sendEmailNotifications] Processing " + peopleIds.length + " unique people");
 
-    const notificationPrefs = (await NotificationHelper.repos.notificationPreference.loadByPersonIds(peopleIds)) as any[];
+    const notificationPrefs = await NotificationHelper.repos.notificationPreference.loadByPersonIds(peopleIds);
 
     const todoPrefs: NotificationPreference[] = [];
     for (const personId of peopleIds) {
@@ -919,14 +925,14 @@ export class NotificationHelper {
       // Reply-to: the person who triggered each notification (DM sender, task
       // assigner, etc.) is carried on triggeredByPersonId.
       const triggerIds = [...new Set(allNotifications.map((n) => n.triggeredByPersonId).filter((id): id is string => !!id))];
-      let triggerEmailData: any[] = [];
+      let triggerEmailData: { id?: string; email?: string }[] = [];
       if (triggerIds.length > 0) {
         const triggerPrefs = triggerIds.map((personId) => ({ personId } as NotificationPreference));
         triggerEmailData = await this.getEmailData(triggerPrefs);
       }
 
       // Batch-load every recipient's overrides once (mirrors the batched pref load above).
-      const allOverrides = (await NotificationHelper.repos.notificationPreferenceOverride.loadByPersonIds(ArrayHelper.getIds(todoPrefs, "personId"))) as any[] || [];
+      const allOverrides = (await NotificationHelper.repos.notificationPreferenceOverride.loadByPersonIds(ArrayHelper.getIds(todoPrefs, "personId"))) || [];
 
       for (const pref of todoPrefs) {
         const allPersonNotifs: Notification[] = ArrayHelper.getAll(allNotifications, "personId", pref.personId);
@@ -961,7 +967,7 @@ export class NotificationHelper {
   };
 
   static markMethod = (notifications: Notification[], method: string) => {
-    const promises: Promise<any>[] = [];
+    const promises: Promise<Notification>[] = [];
     notifications.forEach((notification) => {
       notification.deliveryMethod = method;
       promises.push(NotificationHelper.repos.notification.save(notification));
@@ -982,6 +988,16 @@ export class NotificationHelper {
 
   // conversations.title is a snapshot from the first message; group renames never sync it, so resolve the live name (issue #973)
   static resolveConversationTitle = async (conversation: Conversation): Promise<string> => {
+    // Task and card note threads are stored as "Task #<id> Notes"; name the task instead (#1586)
+    if ((conversation.contentType === "task" || conversation.contentType === "workflowCard") && conversation.contentId) {
+      try {
+        const { getDoingModuleGateway } = await import("../../../shared/modules/DoingModuleGateway.js");
+        const task = await getDoingModuleGateway().loadTask(conversation.churchId, conversation.contentId);
+        return task?.title ? task.title + " Notes" : conversation.title;
+      } catch {
+        return conversation.title;
+      }
+    }
     const groupId = conversation.groupId || ((conversation.contentType === "group" || conversation.contentType === "groupAnnouncement") ? conversation.contentId : null);
     if (!groupId || (conversation.contentType !== "group" && conversation.contentType !== "groupAnnouncement")) return conversation.title;
     try {
@@ -996,7 +1012,7 @@ export class NotificationHelper {
   static resolveNoteLink = async (conversation: Conversation): Promise<string | undefined> => {
     const id = conversation.contentId;
     if (!id) return undefined;
-    const adminRoot = (Environment.b1AdminRoot || "https://admin.b1.church").replace(/\/$/, "");
+    const adminRoot = NotificationHelper.adminRoot();
     switch (conversation.contentType) {
       case "groupNote": return `/mobile/groups/${id}?openChat=1&chatTab=notes`;
       case "person":
@@ -1017,15 +1033,15 @@ export class NotificationHelper {
 
   static peopleInChurch = async (churchId: string, peopleIds: string[]): Promise<string[]> => {
     if (!churchId || !peopleIds.length) return [];
-    const membershipRepos = await RepoManager.getRepos<any>("membership");
-    return ((await membershipRepos.person.loadByIds(churchId, [...new Set(peopleIds)])) as any[]).map((p) => p.id);
+    const membershipRepos = await RepoManager.getRepos<MembershipRepos>("membership");
+    return (await membershipRepos.person.loadByIds(churchId, [...new Set(peopleIds)])).map((p) => p.id);
   };
 
   static getEmailData = async (notificationPrefs: NotificationPreference[]) => {
     const peopleIds = ArrayHelper.getIds(notificationPrefs, "personId");
     if (!peopleIds.length) return [];
-    const membershipRepos = await RepoManager.getRepos<any>("membership");
-    const people: any[] = (await membershipRepos.person.loadByIdsOnly(peopleIds)) as any[];
+    const membershipRepos = await RepoManager.getRepos<MembershipRepos>("membership");
+    const people: ForeignPersonRow[] = await membershipRepos.person.loadByIdsOnly(peopleIds);
     return people.map((p) => ({ id: p.id, email: p.email }));
   };
 
@@ -1079,7 +1095,7 @@ export class NotificationHelper {
     const from = await NotificationHelper.churchFrom(firstNotification.churchId);
     for (const address of addresses) {
       try {
-        await EmailHelper.sendTemplatedEmail(from, address, "B1.church", "https://admin.b1.church", title, content, "ChurchEmailTemplate.html", replyTo);
+        await EmailHelper.sendTemplatedEmail(from, address, "B1.church", NotificationHelper.adminRoot(), title, content, "ChurchEmailTemplate.html", replyTo);
         emailSuccess = true;
       } catch (error) {
         emailError = String(error);

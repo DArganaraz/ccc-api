@@ -3,7 +3,31 @@ import Axios from "axios";
 import Stripe from "stripe";
 import { StripeHelper } from "../StripeHelper.js";
 import { Environment } from "../Environment.js";
-import { IGatewayProvider, WebhookResult, ChargeResult, SubscriptionResult, GatewayConfig, ProviderCapabilities, WebhookEventClassification, ReplayEvent } from "./IGatewayProvider.js";
+import type { Customer, PaymentDetails } from "../../../modules/giving/models/index.js";
+import {
+  IGatewayProvider, WebhookResult, ChargeResult, SubscriptionResult, GatewayConfig, ProviderCapabilities, WebhookEventClassification, ReplayEvent,
+  GatewayObject, GatewayPaymentRequest, GatewaySubscriptionUpdate, GivingRepos, StripeEventObject, StripeEventRecord, NormalizedPaymentMethod,
+  GatewayErrorMapping, GatewayAttachOptions, RefundOptions
+} from "./IGatewayProvider.js";
+
+// A charge awaiting 3DS carries what the client needs to finish authentication.
+interface StripeChargeData extends GatewayObject {
+  client_secret?: string;
+  payment_intent_id?: string;
+}
+
+// PaymentDetails plus the PaymentIntent fields a charge may set.
+interface StripePaymentData extends PaymentDetails {
+  return_url?: string;
+  payment_method_types?: string[];
+  mandate?: string;
+}
+
+// Shape of a Stripe SDK error, as read by mapError.
+interface StripeErrorLike {
+  type?: string;
+  code?: string;
+}
 
 const DONATION_EVENTS = ["charge.succeeded", "invoice.paid", "payment_intent.succeeded", "payment_intent.processing"];
 
@@ -40,7 +64,8 @@ export class StripeGatewayProvider implements IGatewayProvider {
       return { action: "donation", status: eventType === "payment_intent.processing" ? "pending" : "complete" };
     }
     if (eventType === "invoice.payment_failed") return { action: "donation", status: "failed" };
-    if (eventType === "charge.refunded") return { action: "donation", status: "refunded" };
+    // A lost dispute takes the money back like a refund; verifyWebhookSignature drops won/other closes.
+    if (eventType === "charge.refunded" || eventType === "charge.dispute.closed") return { action: "donation", status: "refunded" };
     if (eventType === "customer.subscription.deleted") return { action: "cancel-subscription" };
     return { action: "ignore" };
   }
@@ -54,7 +79,7 @@ export class StripeGatewayProvider implements IGatewayProvider {
     await StripeHelper.deleteWebhooksByChurchId(config.privateKey, churchId);
   }
 
-  async verifyWebhookSignature(config: GatewayConfig, headers: express.Request["headers"], body: any): Promise<WebhookResult> {
+  async verifyWebhookSignature(config: GatewayConfig, headers: express.Request["headers"], body: string | Buffer): Promise<WebhookResult> {
     try {
       const sig = headers["stripe-signature"]?.toString();
       // stripe-node verifies an HMAC keyed with "" too, so an unset secret would accept forged events.
@@ -62,20 +87,23 @@ export class StripeGatewayProvider implements IGatewayProvider {
         return { success: false, shouldProcess: false };
       }
 
-      const stripeEvent = await StripeHelper.verifySignature(config.privateKey, { body } as any, sig, config.webhookKey);
-      const eventData = stripeEvent.data.object as any;
+      const stripeEvent = await StripeHelper.verifySignature(config.privateKey, { body }, sig, config.webhookKey);
+      const eventData = stripeEvent.data.object as StripeEventObject;
       const subscriptionEvent = eventData.subscription || eventData.description?.toLowerCase().includes("subscription");
 
       // Skip processing subscription charge.succeeded events to avoid duplicates
       // Also skip payment_intent.succeeded for subscription invoices (handled by invoice.paid)
       let shouldProcess = true;
-      if (stripeEvent.type === "charge.succeeded" && subscriptionEvent) {
+      // A charge made through a PaymentIntent is recorded from payment_intent.succeeded; processing
+      // charge.succeeded too let the two concurrent deliveries both insert the gift.
+      if (stripeEvent.type === "charge.succeeded" && (subscriptionEvent || eventData.payment_intent)) {
         shouldProcess = false;
       }
       if (stripeEvent.type === "payment_intent.succeeded" && eventData.invoice) {
         // This is a subscription payment - handled by invoice.paid
         shouldProcess = false;
       }
+      if (stripeEvent.type === "charge.dispute.closed" && eventData.status !== "lost") shouldProcess = false;
 
       return {
         success: true,
@@ -89,24 +117,24 @@ export class StripeGatewayProvider implements IGatewayProvider {
     }
   }
 
-  async processCharge(config: GatewayConfig, donationData: any): Promise<ChargeResult> {
+  async processCharge(config: GatewayConfig, donationData: GatewayPaymentRequest): Promise<ChargeResult> {
 
     const currency = donationData?.currency || "usd";
 
-    const paymentData = { amount: donationData.amount, currency, customer: donationData.customerId, metadata: { funds: JSON.stringify(donationData.funds), notes: donationData.notes } };
+    const paymentData: StripePaymentData = { amount: donationData.amount, currency, customer: donationData.customerId, metadata: { funds: JSON.stringify(donationData.funds), memo: donationData.notes } };
 
     if (donationData.type === "card") {
-      (paymentData as any).payment_method = donationData.id;
-      (paymentData as any).confirm = true;
+      paymentData.payment_method = donationData.id;
+      paymentData.confirm = true;
       // Only use off_session for recurring/saved card payments, not for on-session donations
       // This allows 3DS authentication to work properly when the customer is present
       if (donationData.off_session === true) {
-        (paymentData as any).off_session = true;
+        paymentData.off_session = true;
       } else {
         // For on-session payments with 3DS, Stripe requires a return_url for redirect-based authentication
         const returnUrl = donationData.church?.churchURL || donationData.return_url;
         if (returnUrl) {
-          (paymentData as any).return_url = returnUrl;
+          paymentData.return_url = returnUrl;
         }
       }
     }
@@ -114,15 +142,15 @@ export class StripeGatewayProvider implements IGatewayProvider {
       // Check if this is a new PaymentMethod (pm_xxx) or legacy Source (ba_xxx)
       if (donationData.id?.startsWith("pm_")) {
         // New PaymentMethod API flow - use Payment Intents
-        (paymentData as any).payment_method = donationData.id;
+        paymentData.payment_method = donationData.id;
         const bankType = StripeHelper.bankMethodType(config.currency);
-        (paymentData as any).payment_method_types = [bankType];
-        (paymentData as any).confirm = true;
-        (paymentData as any).off_session = true;
-        if (bankType === "acss_debit") (paymentData as any).mandate = await StripeHelper.findAcssMandate(config.privateKey, donationData.customerId, donationData.id);
+        paymentData.payment_method_types = [bankType];
+        paymentData.confirm = true;
+        paymentData.off_session = true;
+        if (bankType === "acss_debit") paymentData.mandate = await StripeHelper.findAcssMandate(config.privateKey, donationData.customerId, donationData.id);
       } else {
         // Legacy Source-based flow (deprecated - will be removed after migration)
-        (paymentData as any).source = donationData.id;
+        paymentData.source = donationData.id;
       }
     }
 
@@ -130,16 +158,19 @@ export class StripeGatewayProvider implements IGatewayProvider {
       const result = await StripeHelper.donate(config.privateKey, paymentData);
 
       // Check if 3DS authentication is required
-      if (result?.status === "requires_action" && result?.client_secret) {
+      // Only a PaymentIntent can be requires_action.
+      const intent = result as Stripe.PaymentIntent;
+      if (result?.status === "requires_action" && intent?.client_secret) {
+        const data: StripeChargeData = {
+          ...result,
+          status: "requires_action",
+          client_secret: intent.client_secret,
+          payment_intent_id: result.id
+        };
         return {
           success: true,
           transactionId: result?.id || "",
-          data: {
-            ...result,
-            status: "requires_action",
-            client_secret: result.client_secret,
-            payment_intent_id: result.id
-          }
+          data
         };
       }
 
@@ -148,18 +179,18 @@ export class StripeGatewayProvider implements IGatewayProvider {
         transactionId: result?.id || "",
         data: result
       };
-    } catch (err: any) {
-      console.error("Stripe charge error:", err?.message || err);
+    } catch (err) {
+      console.error("Stripe charge error:", (err as Error)?.message || err);
       return {
         success: false,
         transactionId: "",
         data: null,
-        error: err?.message || "Payment processing failed"
+        error: (err as Error)?.message || "Payment processing failed"
       };
     }
   }
 
-  async createSubscription(config: GatewayConfig, subscriptionData: any): Promise<SubscriptionResult> {
+  async createSubscription(config: GatewayConfig, subscriptionData: GatewayPaymentRequest): Promise<SubscriptionResult> {
     const paymentData = {
       payment_method_id: subscriptionData.id,
       amount: subscriptionData.amount,
@@ -168,8 +199,8 @@ export class StripeGatewayProvider implements IGatewayProvider {
       type: subscriptionData.type,
       billing_cycle_anchor: subscriptionData.billing_cycle_anchor,
       proration_behavior: subscriptionData.proration_behavior,
-      interval: subscriptionData.interval,
-      metadata: { notes: subscriptionData.notes },
+      interval: subscriptionData.interval as Stripe.SubscriptionCreateParams.Item.PriceData.Recurring,
+      metadata: { memo: subscriptionData.notes },
       productId: config.productId
     };
 
@@ -181,7 +212,7 @@ export class StripeGatewayProvider implements IGatewayProvider {
     };
   }
 
-  async updateSubscription(config: GatewayConfig, subscriptionData: any): Promise<SubscriptionResult> {
+  async updateSubscription(config: GatewayConfig, subscriptionData: GatewaySubscriptionUpdate): Promise<SubscriptionResult> {
     const result = await StripeHelper.updateSubscription(config.privateKey, subscriptionData);
     return {
       success: !!result,
@@ -264,17 +295,17 @@ export class StripeGatewayProvider implements IGatewayProvider {
     return await StripeHelper.createProduct(config.privateKey, churchId);
   }
 
-  async logEvent(churchId: string, event: any, eventData: any, repos: any): Promise<void> {
+  async logEvent(churchId: string, event: Buffer | string | StripeEventRecord, eventData: StripeEventObject, repos: GivingRepos): Promise<void> {
     // The webhook route hands over the raw body (kept raw for signature checks); without parsing, providerId/eventType save as NULL.
     const parsed = Buffer.isBuffer(event) || typeof event === "string" ? JSON.parse(event.toString()) : event;
     await StripeHelper.logEvent(churchId, parsed, eventData, repos);
   }
 
-  async logDonation(config: GatewayConfig, churchId: string, eventData: any, repos: any, status: "pending" | "complete" | "failed" = "complete"): Promise<any> {
+  async logDonation(config: GatewayConfig, churchId: string, eventData: StripeEventObject, repos: GivingRepos, status: "pending" | "complete" | "failed" = "complete") {
     return await StripeHelper.logDonation(config.privateKey, churchId, eventData, repos, status);
   }
 
-  async updateDonationStatus(churchId: string, transactionId: string, status: "pending" | "complete" | "failed" | "refunded", repos: any): Promise<void> {
+  async updateDonationStatus(churchId: string, transactionId: string, status: "pending" | "complete" | "failed" | "refunded", repos: GivingRepos): Promise<void> {
     await StripeHelper.updateDonationStatus(churchId, transactionId, status, repos);
   }
 
@@ -285,23 +316,28 @@ export class StripeGatewayProvider implements IGatewayProvider {
       const invoice = await StripeHelper.payInvoice(config.privateKey, invoiceId);
       if (invoice.status === "paid") return { success: true };
       return { success: false, error: `Invoice is ${invoice.status}` };
-    } catch (e: any) {
-      return { success: false, error: e?.message || "Retry failed" };
+    } catch (e) {
+      return { success: false, error: (e as Error)?.message || "Retry failed" };
     }
   }
 
-  // ponytail: full refund only; a partial refund would take an amount and a "partially refunded" status.
-  async refundCharge(config: GatewayConfig, transactionId: string): Promise<{ success: boolean; refundId?: string; error?: string }> {
+  async refundCharge(config: GatewayConfig, transactionId: string, options?: RefundOptions): Promise<{ success: boolean; refundId?: string; error?: string }> {
     const id = transactionId || "";
     // A donation's transactionId is whichever id the charge path stored, so pass the matching Stripe key.
-    const params = id.startsWith("ch_") ? { charge: id } : id.startsWith("pi_") ? { payment_intent: id } : null;
-    if (!params) return { success: false, error: "Only card and bank charges can be refunded" };
+    const target = id.startsWith("ch_") ? { charge: id } : id.startsWith("pi_") ? { payment_intent: id } : null;
+    if (!target) return { success: false, error: "Only card and bank charges can be refunded" };
+    const params: Stripe.RefundCreateParams = { ...target };
+    if (options?.amount !== undefined) {
+      const minor = StripeHelper.toMinorUnits(options.amount, options.currency || config.currency);
+      if (!(minor > 0)) return { success: false, error: "Refund amount must be greater than zero" };
+      params.amount = minor;
+    }
     try {
-      const refund = await StripeHelper.createRefund(config.privateKey, params);
+      const refund = await StripeHelper.createRefund(config.privateKey, params, options?.idempotencyKey);
       if (refund.status === "failed" || refund.status === "canceled") return { success: false, error: `Refund ${refund.status}` };
       return { success: true, refundId: refund.id };
-    } catch (e: any) {
-      return { success: false, error: e?.message || "Refund failed" };
+    } catch (e) {
+      return { success: false, error: (e as Error)?.message || "Refund failed" };
     }
   }
 
@@ -312,24 +348,26 @@ export class StripeGatewayProvider implements IGatewayProvider {
 
   async getCustomerCreatedAt(config: GatewayConfig, customerId: string): Promise<Date | null> {
     try {
-      const customer: any = await new Stripe(config.privateKey, { apiVersion: "2025-02-24.acacia" }).customers.retrieve(customerId);
-      return customer && !customer.deleted && customer.created ? new Date(customer.created * 1000) : null;
+      const customer: Stripe.Customer | Stripe.DeletedCustomer = await new Stripe(config.privateKey, { apiVersion: "2025-02-24.acacia" }).customers.retrieve(customerId);
+      // Past the deleted check it is a live Customer.
+      const created = (customer as Stripe.Customer)?.created;
+      return customer && !customer.deleted && created ? new Date(created * 1000) : null;
     } catch {
       return null;
     }
   }
 
-  async getCustomerSubscriptions(config: GatewayConfig, customerId: string): Promise<any> {
+  async getCustomerSubscriptions(config: GatewayConfig, customerId: string) {
     return await StripeHelper.getCustomerSubscriptions(config.privateKey, customerId);
   }
 
-  async getCustomerPaymentMethods(config: GatewayConfig, customer: any): Promise<any> {
+  async getCustomerPaymentMethods(config: GatewayConfig, customer: Customer) {
     return await StripeHelper.getCustomerPaymentMethods(config.privateKey, customer);
   }
 
-  async listNormalizedPaymentMethods(config: GatewayConfig, customer: any, _repos: any): Promise<any[]> {
+  async listNormalizedPaymentMethods(config: GatewayConfig, customer: Customer, _repos: GivingRepos): Promise<NormalizedPaymentMethod[]> {
     const raw = await this.getCustomerPaymentMethods(config, customer);
-    const normalized: any[] = [];
+    const normalized: NormalizedPaymentMethod[] = [];
     if (!Array.isArray(raw)) return normalized;
     for (const customerData of raw) {
       for (const pm of customerData.cards?.data || []) {
@@ -339,7 +377,8 @@ export class StripeGatewayProvider implements IGatewayProvider {
           provider: this.name,
           name: pm.card?.brand || "Card",
           last4: pm.card?.last4,
-          customerId: pm.customer || customerData.customer?.id,
+          // Unexpanded list results carry the customer id string.
+          customerId: (pm.customer as string) || customerData.customer?.id,
           gatewayId: config.gatewayId,
           status: "active"
         });
@@ -351,19 +390,20 @@ export class StripeGatewayProvider implements IGatewayProvider {
           provider: this.name,
           name: bank.us_bank_account?.bank_name || bank.acss_debit?.bank_name || "Bank Account",
           last4: bank.us_bank_account?.last4 || bank.acss_debit?.last4,
-          customerId: bank.customer || customerData.customer?.id,
+          customerId: (bank.customer as string) || customerData.customer?.id,
           gatewayId: config.gatewayId,
           status: "active"
         });
       }
-      for (const bank of customerData.legacyBanks?.data || []) {
+      // listSources was filtered to object: "bank_account".
+      for (const bank of (customerData.legacyBanks?.data || []) as Stripe.BankAccount[]) {
         normalized.push({
           id: bank.id,
           type: "bank",
           provider: this.name,
           name: "Bank Account",
           last4: bank.last4,
-          customerId: bank.customer || customerData.customer?.id,
+          customerId: (bank.customer as string) || customerData.customer?.id,
           gatewayId: config.gatewayId,
           status: bank.status || "new",
           isLegacy: true
@@ -381,7 +421,7 @@ export class StripeGatewayProvider implements IGatewayProvider {
     return id.startsWith("pm_") || id.startsWith("ba_");
   }
 
-  async verifyMethodOwnership(config: GatewayConfig, paymentMethodId: string, customerId: string, repos: any): Promise<boolean> {
+  async verifyMethodOwnership(config: GatewayConfig, paymentMethodId: string, customerId: string, repos: GivingRepos): Promise<boolean> {
     try {
       const customerData = await repos.customer.load(config.churchId, customerId);
       const customer = customerData ? repos.customer.convertToModel(config.churchId, customerData) : null;
@@ -400,12 +440,17 @@ export class StripeGatewayProvider implements IGatewayProvider {
     }
   }
 
-  async deletePaymentMethod(config: GatewayConfig, paymentMethodId: string, customerId: string, _repos: any): Promise<void> {
+  async activeSubscriptionIdsUsingMethod(config: GatewayConfig, paymentMethodId: string, customerId: string): Promise<string[]> {
+    return await StripeHelper.getActiveSubscriptionIdsUsingMethod(config.privateKey, customerId, paymentMethodId);
+  }
+
+  async deletePaymentMethod(config: GatewayConfig, paymentMethodId: string, customerId: string, _repos: GivingRepos): Promise<void> {
     if (paymentMethodId.startsWith("ba_")) await this.deleteBankAccount(config, customerId, paymentMethodId);
     else await this.detachPaymentMethod(config, paymentMethodId);
   }
 
-  mapError(e: any): { status: number; body: any } | null {
+  mapError(err: unknown): GatewayErrorMapping | null {
+    const e = err as StripeErrorLike;
     if (e?.type !== "StripeInvalidRequestError") return null;
     if (e.code === "resource_missing") {
       return { status: 404, body: { error: "Payment method not found. Please create a new payment method.", code: "payment_method_not_found" } };
@@ -423,8 +468,9 @@ export class StripeGatewayProvider implements IGatewayProvider {
       // Include payment_intent.succeeded for new ACH payments using Payment Intents API
       types: ["charge.succeeded", "invoice.paid", "payment_intent.succeeded"]
     });
-    return events.map((event: any) => {
-      const eventData = event.data.object as any;
+    return events.map((stripeEvent) => {
+      const event = stripeEvent as StripeEventRecord;
+      const eventData = event.data.object;
       const isSubscriptionEvent = eventData.subscription || eventData.description?.toLowerCase().includes("subscription");
       return {
         id: event.id,
@@ -441,64 +487,64 @@ export class StripeGatewayProvider implements IGatewayProvider {
     });
   }
 
-  async importReplayEvent(config: GatewayConfig, churchId: string, event: ReplayEvent, repos: any): Promise<void> {
+  async importReplayEvent(config: GatewayConfig, churchId: string, event: ReplayEvent, repos: GivingRepos): Promise<void> {
     const eventData = event.raw.data.object;
     await StripeHelper.logEvent(churchId, event.raw, eventData, repos);
     await StripeHelper.logDonation(config.privateKey, churchId, eventData, repos);
   }
 
   // Payment method management
-  async attachPaymentMethod(config: GatewayConfig, paymentMethodId: string, options: any): Promise<any> {
-    return await StripeHelper.attachPaymentMethod(config.privateKey, paymentMethodId, options);
+  async attachPaymentMethod(config: GatewayConfig, paymentMethodId: string, options: GatewayAttachOptions) {
+    return await StripeHelper.attachPaymentMethod(config.privateKey, paymentMethodId, options as Stripe.PaymentMethodAttachParams);
   }
 
-  async detachPaymentMethod(config: GatewayConfig, paymentMethodId: string): Promise<any> {
+  async detachPaymentMethod(config: GatewayConfig, paymentMethodId: string) {
     return await StripeHelper.detachPaymentMethod(config.privateKey, paymentMethodId);
   }
 
-  async updateCard(config: GatewayConfig, paymentMethodId: string, cardData: any): Promise<any> {
+  async updateCard(config: GatewayConfig, paymentMethodId: string, cardData: Stripe.PaymentMethodUpdateParams) {
     return await StripeHelper.updateCard(config.privateKey, paymentMethodId, cardData);
   }
 
-  async createBankAccount(config: GatewayConfig, customerId: string, options: any): Promise<any> {
+  async createBankAccount(config: GatewayConfig, customerId: string, options: Stripe.CustomerCreateSourceParams) {
     return await StripeHelper.createBankAccount(config.privateKey, customerId, options);
   }
 
-  async updateBank(config: GatewayConfig, paymentMethodId: string, bankData: any, customerId: string): Promise<any> {
+  async updateBank(config: GatewayConfig, paymentMethodId: string, bankData: Stripe.CustomerUpdateSourceParams, customerId: string) {
     return await StripeHelper.updateBank(config.privateKey, paymentMethodId, bankData, customerId);
   }
 
-  async verifyBank(config: GatewayConfig, paymentMethodId: string, amountData: any, customerId: string): Promise<any> {
+  async verifyBank(config: GatewayConfig, paymentMethodId: string, amountData: Stripe.CustomerVerifySourceParams, customerId: string) {
     return await StripeHelper.verifyBank(config.privateKey, paymentMethodId, amountData, customerId);
   }
 
-  async deleteBankAccount(config: GatewayConfig, customerId: string, bankAccountId: string): Promise<any> {
+  async deleteBankAccount(config: GatewayConfig, customerId: string, bankAccountId: string) {
     return await StripeHelper.deleteBankAccount(config.privateKey, customerId, bankAccountId);
   }
 
-  async addCard(config: GatewayConfig, customerId: string, cardData: any): Promise<any> {
+  async addCard(config: GatewayConfig, customerId: string, cardData: string | Stripe.CustomerCreateSourceParams) {
     return await StripeHelper.addCard(config.privateKey, customerId, cardData);
   }
 
-  async getCharge(config: GatewayConfig, chargeId: string): Promise<any> {
+  async getCharge(config: GatewayConfig, chargeId: string) {
     return await StripeHelper.getCharge(config.privateKey, chargeId);
   }
 
   // Token-based payment methods
-  async createSetupIntent(config: GatewayConfig, customerId?: string): Promise<any> {
+  async createSetupIntent(config: GatewayConfig, customerId?: string) {
     return await StripeHelper.createSetupIntent(config.privateKey, customerId);
   }
 
   // ACH SetupIntent for Financial Connections
-  async createACHSetupIntent(config: GatewayConfig, customerId: string, instantOnly = false): Promise<any> {
+  async createACHSetupIntent(config: GatewayConfig, customerId: string, instantOnly = false) {
     return await StripeHelper.createACHSetupIntent(config.privateKey, customerId, config.currency, instantOnly);
   }
 
-  async createPaymentMethod(config: GatewayConfig, paymentMethodData: any): Promise<any> {
+  async createPaymentMethod(config: GatewayConfig, paymentMethodData: Stripe.PaymentMethodCreateParams) {
     return await StripeHelper.createPaymentMethod(config.privateKey, paymentMethodData);
   }
 
-  async confirmSetupIntent(config: GatewayConfig, setupIntentId: string, paymentMethodId: string): Promise<any> {
+  async confirmSetupIntent(config: GatewayConfig, setupIntentId: string, paymentMethodId: string) {
     return await StripeHelper.confirmSetupIntent(config.privateKey, setupIntentId, paymentMethodId);
   }
 

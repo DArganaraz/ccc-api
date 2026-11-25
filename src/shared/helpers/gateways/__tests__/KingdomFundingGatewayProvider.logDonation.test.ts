@@ -3,16 +3,17 @@ jest.mock("../../Environment", () => ({ Environment: { membershipApi: "http://te
 
 import { KingdomFundingGatewayProvider } from "../KingdomFundingGatewayProvider";
 import { GatewayConfig } from "../IGatewayProvider";
+import type { Donation } from "../../../../modules/giving/models";
 
 // Webhooks arrive without fund data; recovery prevents unallocated money.
 describe("KingdomFundingGatewayProvider.logDonation fund recovery", () => {
   const provider = new KingdomFundingGatewayProvider();
 
-  const makeRepos = (overrides: any = {}) => ({
+  const makeRepos = (overrides: Record<string, unknown> = {}) => ({
     customer: { load: jest.fn().mockResolvedValue(null) },
     donation: {
       loadByTransactionId: jest.fn().mockResolvedValue(null),
-      save: jest.fn().mockImplementation(async (d: any) => ({ ...d, id: "don1" }))
+      save: jest.fn().mockImplementation(async (d: Donation) => ({ ...d, id: "don1" }))
     },
     donationBatch: { getOrCreateCurrent: jest.fn().mockResolvedValue({ id: "batch1" }) },
     fundDonation: { save: jest.fn().mockResolvedValue({}) },
@@ -65,5 +66,14 @@ describe("KingdomFundingGatewayProvider.logDonation fund recovery", () => {
     expect(repos.subscription.loadByCustomerId).not.toHaveBeenCalled();
     expect(repos.fund.getOrCreateGeneral).not.toHaveBeenCalled();
     expect(repos.donation.save.mock.calls[0][1]).toEqual([expect.objectContaining({ fundId: "fa", amount: 75 })]);
+  });
+
+  it("stores the donor's note from the /charge path as the memo and keeps the reference internal", async () => {
+    const repos = makeRepos();
+    const eventData = { auth_amount: 75, funds: [{ id: "fa", amount: 75 }], reference_number: 558, notes: "Youth trip" };
+
+    await provider.logDonation({} as GatewayConfig, "ch1", eventData, repos, "complete");
+
+    expect(repos.donation.save.mock.calls[0][0]).toMatchObject({ memo: "Youth trip", notes: "KingdomFunding ref: 558" });
   });
 });

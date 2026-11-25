@@ -1,5 +1,6 @@
 import { Environment } from "../../../shared/helpers/Environment.js";
 import { TransactionalEmailHelper } from "../../../shared/helpers/TransactionalEmailHelper.js";
+import { AppUrlHelper } from "../../../shared/helpers/AppUrlHelper.js";
 import { Registration, RegistrationMember, Event } from "../models/index.js";
 
 export class RegistrationHelper {
@@ -20,8 +21,7 @@ export class RegistrationHelper {
 
   // The church's member website, from B1APP_ROOT (e.g. https://{subdomain}.b1.church, or a fixed address).
   static memberSiteUrl(subDomain?: string): string {
-    if (!subDomain || !Environment.b1AppRoot) return "";
-    return Environment.b1AppRoot.split("{subdomain}").join(subDomain).replace(/\/$/, "");
+    return subDomain && Environment.b1AppRoot ? AppUrlHelper.b1AppUrl(subDomain) : "";
   }
 
   static async sendConfirmationEmail(email: string, churchName: string, event: Event, registration: Registration, members: RegistrationMember[], timeZone?: string, subDomain?: string) {
@@ -51,11 +51,44 @@ export class RegistrationHelper {
         <tr><td><strong>Status:</strong></td><td>${registration.status}</td></tr>
       </table>
       ${memberList}
+      ${this.confirmationMessageHtml(event, registration)}
       ${siteLine}
       <p>If you need to cancel your registration, please visit the church website or contact the church office.</p>
     `;
 
     await TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(churchName), email, churchName, siteUrl || Environment.b1AdminRoot, "Registration Confirmed: " + event.title, contents);
+  }
+
+  // The event's optional confirmation message is plain text: escape it and keep its line breaks.
+  // A waitlisted registrant has no spot yet, so the message (often directions or a meeting link) waits.
+  static confirmationMessageHtml(event: Event, registration: Registration): string {
+    const message = (event?.confirmationMessage || "").trim();
+    if (!message || registration?.status === "waitlisted") return "";
+    return `<p>${this.escapeHtml(message).replace(/\r?\n/g, "<br>")}</p>`;
+  }
+
+  static async sendBalanceReminderEmail(email: string, churchName: string, event: Event, amounts: { total: string; paid: string; balance: string }, payUrl?: string, timeZone?: string) {
+    if (!email) return;
+
+    const tz = this.validTimeZone(timeZone);
+    const eventDate = event.start ? new Date(event.start).toLocaleDateString("en-AU", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: tz }) : "";
+    const payLine = payUrl
+      ? `<p>You can <a href="${this.escapeHtml(payUrl)}">pay your balance from My Registrations</a>.</p>`
+      : `<p>Please contact the church office to pay your balance.</p>`;
+
+    const contents = `
+      <h2>Balance Due</h2>
+      <p>Your registration for <strong>${this.escapeHtml(event.title)}</strong> has a balance due.</p>
+      <table role="presentation" style="text-align: left;" cellspacing="8">
+        ${eventDate ? `<tr><td><strong>Date:</strong></td><td>${eventDate}</td></tr>` : ""}
+        <tr><td><strong>Total:</strong></td><td>${this.escapeHtml(amounts.total)}</td></tr>
+        <tr><td><strong>Paid:</strong></td><td>${this.escapeHtml(amounts.paid)}</td></tr>
+        <tr><td><strong>Balance due:</strong></td><td>${this.escapeHtml(amounts.balance)}</td></tr>
+      </table>
+      ${payLine}
+    `;
+
+    await TransactionalEmailHelper.sendTransactional(TransactionalEmailHelper.fromAddress(churchName), email, churchName, Environment.b1AdminRoot, "Balance Due: " + event.title, contents);
   }
 
   static async sendWaitlistAvailabilityEmail(email: string, churchName: string, event: Event, payUrl?: string) {
